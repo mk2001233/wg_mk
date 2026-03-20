@@ -1,0 +1,22 @@
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Copied deployment state and secrets
+data/
+deployment-info.txt
+wg-easy.db
+wg0.conf
+
+# Local logs
+*.log

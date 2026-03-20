@@ -14,6 +14,11 @@ PROXY_URL="${WG_EASY_PROXY_URL:-http://127.0.0.1:11066}"
 PROXY_MODE="${WG_EASY_PROXY_MODE:-auto}"
 PULL_TIMEOUT_SECONDS="${WG_EASY_PULL_TIMEOUT_SECONDS:-900}"
 SHELL_PROXY_ENABLED=0
+WG_EASY_ALLOWED_IPS_EXPLICIT=0
+
+if [[ -n "${WG_EASY_ALLOWED_IPS+x}" ]]; then
+  WG_EASY_ALLOWED_IPS_EXPLICIT=1
+fi
 
 log() {
   printf '[wg-easy] %s\n' "$*"
@@ -269,7 +274,13 @@ set_defaults() {
   : "${WG_EASY_DNS:=1.1.1.1,8.8.8.8}"
   : "${WG_EASY_IPV4_CIDR:=10.8.0.0/24}"
   : "${WG_EASY_IPV6_CIDR:=fd00:dead:beef::/64}"
-  : "${WG_EASY_ALLOWED_IPS:=0.0.0.0/0,::/0}"
+
+  if [[ -z "${WG_EASY_ALLOWED_IPS+x}" ]]; then
+    WG_EASY_ALLOWED_IPS="${WG_EASY_IPV4_CIDR}"
+  elif [[ "$WG_EASY_ALLOWED_IPS_EXPLICIT" -eq 0 && "$WG_EASY_ALLOWED_IPS" == "0.0.0.0/0,::/0" ]]; then
+    WG_EASY_ALLOWED_IPS="${WG_EASY_IPV4_CIDR}"
+  fi
+
   : "${WG_EASY_PUBLIC_HOST:=$(detect_public_host)}"
 }
 
@@ -305,10 +316,6 @@ EOF
 }
 
 write_env_file() {
-  if [[ -f "$ENV_FILE" ]]; then
-    return 0
-  fi
-
   cat >"$ENV_FILE" <<EOF
 WG_EASY_PUBLIC_HOST=${WG_EASY_PUBLIC_HOST}
 WG_EASY_VPN_PORT=${WG_EASY_VPN_PORT}

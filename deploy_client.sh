@@ -3,8 +3,30 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
-TARGET_DIR="${WG_MACOS_CONFIG_DIR:-$HOME/.config/wireguard}"
+USER_HOME="${HOME:-}"
+if [[ -z "$USER_HOME" ]]; then
+  USER_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+fi
+if [[ -z "$USER_HOME" ]]; then
+  USER_HOME="/var/root"
+fi
+TARGET_DIR="${WG_MACOS_CONFIG_DIR:-$USER_HOME/.config/wireguard}"
+MANAGED_TUNNEL_NAME="wg_mk"
+MANAGED_IPV4_PREFIX="10.8.0."
+MANAGED_IPV4_CIDR="10.8.0.0/24"
+MANAGED_ALLOWED_IPS="${MANAGED_IPV4_CIDR}"
+MANAGED_IPV6_PREFIX="fd00:dead:beef:"
+DEFAULT_WG_EASY_URL="http://39.96.200.42:51821"
+DEFAULT_WG_EASY_USER="admin"
+DEFAULT_WG_EASY_PASSWORD="71082aaa348e3b03d45bf7f6a2c41ef18fe3"
+STARTUP_LABEL="com.mk.wg_mk.client"
+STARTUP_PLIST="/Library/LaunchDaemons/${STARTUP_LABEL}.plist"
+STARTUP_LOG_DIR="/var/log/wg_mk"
+STARTUP_STDOUT_LOG="${STARTUP_LOG_DIR}/client-startup.log"
+STARTUP_STDERR_LOG="${STARTUP_LOG_DIR}/client-startup.err"
+STARTUP_SYSTEM_CONFIG_DIR="/usr/local/etc/wireguard"
 TUNNEL_NAME=""
+TUNNEL_NAME_EXPLICIT=0
 CONFIG_FILE=""
 CONFIG_BASE64=""
 WG_EASY_API_URL="${WG_EASY_API_URL:-}"
@@ -21,6 +43,10 @@ BRING_DOWN=0
 SHOW_STATUS=0
 FORCE=0
 PRINT_PATH=0
+STARTUP_INSTALL=0
+STARTUP_REMOVE=0
+STARTUP_STATUS=0
+STARTUP_RUN=0
 
 if [[ -d "${SCRIPT_DIR}/bin" ]]; then
   PATH="${SCRIPT_DIR}/bin:${PATH}"
@@ -42,7 +68,19 @@ optionally fetch it directly from a wg-easy server or create it there first,
 optionally install CLI tools via Homebrew, and optionally bring the tunnel up.
 
 With no arguments, the script defaults to:
-  --tunnel-name MaxdeMacBook-Ai --up
+  --wg-easy-url ${DEFAULT_WG_EASY_URL}
+  --wg-easy-user ${DEFAULT_WG_EASY_USER}
+  --wg-easy-client-name <local-host-name>
+  --tunnel-name ${MANAGED_TUNNEL_NAME} --force --startup-install
+
+This script manages one local WireGuard tunnel only:
+  ${MANAGED_TUNNEL_NAME}
+
+It accepts only client configs in:
+  ${MANAGED_IPV4_CIDR}
+
+It rewrites peer AllowedIPs to:
+  ${MANAGED_ALLOWED_IPS}
 
 Config input:
   --config-file PATH        Read client config from a .conf file
@@ -59,8 +97,7 @@ Config input:
   --wg-easy-insecure-tls    Allow self-signed or otherwise invalid TLS certs
 
 Config target:
-  --tunnel-name NAME        Tunnel name; defaults to the config file basename,
-                            except raw invocation defaults to MaxdeMacBook-Ai
+  --tunnel-name NAME        Must be ${MANAGED_TUNNEL_NAME} when provided
   --target-dir DIR          Directory for saved configs
   --force                   Overwrite an existing target config
   --print-config-path       Print the final config path after writing/resolving it
@@ -70,15 +107,21 @@ Actions:
   --up                      Bring the tunnel up after writing or from an existing config
   --down                    Bring an existing tunnel down
   --status                  Show current WireGuard status
+  --startup-install         Install startup support with launchd and load it now
+  --startup-remove          Remove startup support
+  --startup-status          Show startup support state
   -h, --help                Show this help
 
 Examples:
   ${SCRIPT_NAME} --config-file ./macbook.conf --install-tools --up
-  ${SCRIPT_NAME} --config-file ./macbook.conf --tunnel-name homevpn
-  ${SCRIPT_NAME} --config-base64 "\$(base64 < ./macbook.conf | tr -d '\n')" --tunnel-name homevpn
+  ${SCRIPT_NAME} --config-file ./macbook.conf --tunnel-name ${MANAGED_TUNNEL_NAME}
+  ${SCRIPT_NAME} --config-base64 "\$(base64 < ./macbook.conf | tr -d '\n')" --tunnel-name ${MANAGED_TUNNEL_NAME}
   WG_EASY_API_PASSWORD='secret' ${SCRIPT_NAME} --wg-easy-url https://vpn.example.com:51821 --wg-easy-user admin --wg-easy-client-name macbook --up
-  cat ./macbook.conf | ${SCRIPT_NAME} --tunnel-name homevpn --up
-  ${SCRIPT_NAME} --tunnel-name homevpn --down
+  cat ./macbook.conf | ${SCRIPT_NAME} --tunnel-name ${MANAGED_TUNNEL_NAME} --up
+  ${SCRIPT_NAME} --tunnel-name ${MANAGED_TUNNEL_NAME} --down
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} --startup-install
+  ${SCRIPT_NAME} --startup-status
   ${SCRIPT_NAME} --status
 EOF
 }
@@ -94,6 +137,56 @@ die() {
 
 require_macos() {
   [[ "$(uname -s)" == "Darwin" ]] || die "This script is intended to run on macOS."
+}
+
+is_root() {
+  [[ "$(id -u)" -eq 0 ]]
+}
+
+run_env() {
+  local -a env_args
+  env_args=(env "PATH=${PATH}")
+
+  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+    env_args+=("DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}")
+  fi
+
+  "${env_args[@]}" "$@"
+}
+
+run_privileged() {
+  if is_root; then
+    "$@"
+    return 0
+  fi
+
+  sudo "$@"
+}
+
+run_privileged_env() {
+  if is_root; then
+    run_env "$@"
+    return 0
+  fi
+
+  local -a env_args
+  env_args=(env "PATH=${PATH}")
+
+  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+    env_args+=("DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}")
+  fi
+
+  sudo "${env_args[@]}" "$@"
+}
+
+xml_escape() {
+  printf '%s' "$1" |
+    sed \
+      -e 's/&/\&amp;/g' \
+      -e 's/</\&lt;/g' \
+      -e 's/>/\&gt;/g' \
+      -e 's/"/\&quot;/g' \
+      -e "s/'/\&apos;/g"
 }
 
 default_local_client_name() {
@@ -176,19 +269,20 @@ sanitize_tunnel_name() {
 resolve_tunnel_name() {
   if [[ -n "$TUNNEL_NAME" ]]; then
     TUNNEL_NAME="$(sanitize_tunnel_name "$TUNNEL_NAME")"
+    [[ "$TUNNEL_NAME" == "$MANAGED_TUNNEL_NAME" ]] ||
+      die "This script manages a single local WireGuard tunnel: ${MANAGED_TUNNEL_NAME}."
     return 0
   fi
 
-  if [[ -n "$CONFIG_FILE" ]]; then
-    TUNNEL_NAME="$(sanitize_tunnel_name "$(basename "${CONFIG_FILE%.conf}")")"
-    return 0
-  fi
-
-  die "--tunnel-name is required when config is not being read from a file path."
+  TUNNEL_NAME="$MANAGED_TUNNEL_NAME"
 }
 
 target_config_path() {
   printf '%s/%s.conf\n' "$TARGET_DIR" "$TUNNEL_NAME"
+}
+
+startup_config_path() {
+  printf '%s/%s.conf\n' "$STARTUP_SYSTEM_CONFIG_DIR" "$MANAGED_TUNNEL_NAME"
 }
 
 have_wg_easy_fetch() {
@@ -197,9 +291,85 @@ have_wg_easy_fetch() {
 
 validate_config_file() {
   local path=$1
+  local addresses entry value
+  local saw_address=0
 
   grep -q '^\[Interface\]' "$path" || die "Config is missing an [Interface] section."
   grep -q '^\[Peer\]' "$path" || die "Config is missing a [Peer] section."
+
+  while IFS= read -r entry; do
+    saw_address=1
+    value="${entry#*=}"
+    while IFS= read -r value; do
+      value="${value## }"
+      value="${value%% }"
+      value="${value%%/*}"
+      [[ -n "$value" ]] || continue
+
+      if [[ "$value" == *:* ]]; then
+        [[ "$value" == "${MANAGED_IPV6_PREFIX}"* ]] ||
+          die "Config IPv6 address ${value} is outside the managed prefix ${MANAGED_IPV6_PREFIX}."
+      else
+        [[ "$value" == "${MANAGED_IPV4_PREFIX}"* ]] ||
+          die "Config IPv4 address ${value} is outside the managed prefix ${MANAGED_IPV4_CIDR}."
+      fi
+    done < <(
+      printf '%s\n' "$value" |
+        tr ',' '\n'
+    )
+  done < <(
+    grep -E '^[[:space:]]*Address[[:space:]]*=' "$path"
+  )
+
+  (( saw_address == 1 )) || die "Config is missing an Address entry."
+}
+
+normalize_config_allowed_ips() {
+  local path=$1
+  local tmp
+  local current
+
+  current="$(
+    grep -E '^[[:space:]]*AllowedIPs[[:space:]]*=' "$path" || true
+  )"
+
+  [[ -n "$current" ]] || die "Config is missing an AllowedIPs entry."
+
+  tmp="$(mktemp)"
+  awk -v allowed_ips="$MANAGED_ALLOWED_IPS" '
+    /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+      print "AllowedIPs = " allowed_ips
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (updated != 1) {
+        exit 10
+      }
+    }
+  ' "$path" >"$tmp" || {
+    rm -f "$tmp"
+    die "Could not normalize AllowedIPs in $path."
+  }
+
+  mv "$tmp" "$path"
+
+  if ! printf '%s\n' "$current" | grep -Eq "^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*${MANAGED_ALLOWED_IPS}[[:space:]]*$"; then
+    log "Normalized AllowedIPs to ${MANAGED_ALLOWED_IPS}"
+  fi
+}
+
+startup_installed() {
+  [[ -f "$STARTUP_PLIST" ]]
+}
+
+apply_default_fetch_settings() {
+  WG_EASY_API_URL="${WG_EASY_API_URL:-$DEFAULT_WG_EASY_URL}"
+  WG_EASY_API_USER="${WG_EASY_API_USER:-$DEFAULT_WG_EASY_USER}"
+  WG_EASY_API_PASSWORD="${WG_EASY_API_PASSWORD:-$DEFAULT_WG_EASY_PASSWORD}"
+  WG_EASY_CLIENT_NAME="${WG_EASY_CLIENT_NAME:-$(default_local_client_name)}"
+  TUNNEL_NAME="$MANAGED_TUNNEL_NAME"
 }
 
 stdin_to_temp() {
@@ -233,6 +403,7 @@ read_config_to_temp() {
   tr -d '\r' <"$tmp" >"${tmp}.lf"
   mv "${tmp}.lf" "$tmp"
 
+  normalize_config_allowed_ips "$tmp"
   validate_config_file "$tmp"
 
   printf '%s\n' "$tmp"
@@ -357,15 +528,156 @@ fetch_wg_easy_config_to_temp() {
 
   tr -d '\r' <"$tmp" >"${tmp}.lf"
   mv "${tmp}.lf" "$tmp"
+  normalize_config_allowed_ips "$tmp"
   validate_config_file "$tmp"
 
   FETCHED_WG_EASY_TMP="$tmp"
   FETCHED_WG_EASY_CLIENT_NAME="$client_name"
   if [[ -z "$TUNNEL_NAME" ]]; then
-    TUNNEL_NAME="$(sanitize_tunnel_name "$client_name")"
+    TUNNEL_NAME="$MANAGED_TUNNEL_NAME"
   fi
 
   log "Fetched wg-easy config for client ${client_name} (${client_id})" >&2
+}
+
+sync_startup_config() {
+  local src=$1
+  local tmp dst
+
+  if (( STARTUP_INSTALL != 1 )) && ! startup_installed; then
+    return 0
+  fi
+
+  dst="$(startup_config_path)"
+  tmp="$(mktemp)"
+  cp "$src" "$tmp"
+
+  run_privileged install -d -m 755 "$STARTUP_SYSTEM_CONFIG_DIR"
+  run_privileged install -m 600 "$tmp" "$dst"
+  rm -f "$tmp"
+
+  log "Synced startup config to $dst"
+}
+
+write_startup_plist() {
+  local tmp=$1
+  local script_path
+  local path_value
+  local dyld_value
+
+  script_path="${SCRIPT_DIR}/deploy_client.sh"
+  path_value="$(xml_escape "${PATH}")"
+  dyld_value="$(xml_escape "${DYLD_LIBRARY_PATH:-}")"
+
+  cat >"$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${STARTUP_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${script_path}</string>
+    <string>--startup-run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${path_value}</string>
+EOF
+
+  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+    cat >>"$tmp" <<EOF
+    <key>DYLD_LIBRARY_PATH</key>
+    <string>${dyld_value}</string>
+EOF
+  fi
+
+  cat >>"$tmp" <<EOF
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>${SCRIPT_DIR}</string>
+  <key>StandardOutPath</key>
+  <string>${STARTUP_STDOUT_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${STARTUP_STDERR_LOG}</string>
+</dict>
+</plist>
+EOF
+}
+
+install_startup_support() {
+  local cfg_path=$1
+  local tmp
+
+  sync_startup_config "$cfg_path"
+
+  tmp="$(mktemp)"
+  write_startup_plist "$tmp"
+
+  run_privileged install -d -m 755 /Library/LaunchDaemons
+  run_privileged install -d -m 755 "$STARTUP_LOG_DIR"
+  run_privileged install -m 644 "$tmp" "$STARTUP_PLIST"
+  run_privileged chown root:wheel "$STARTUP_PLIST"
+  rm -f "$tmp"
+
+  run_privileged launchctl bootout system "$STARTUP_PLIST" >/dev/null 2>&1 || true
+  run_privileged launchctl bootstrap system "$STARTUP_PLIST"
+  run_privileged launchctl enable "system/${STARTUP_LABEL}" >/dev/null 2>&1 || true
+  run_privileged launchctl kickstart -k "system/${STARTUP_LABEL}" >/dev/null 2>&1 || true
+
+  log "Installed startup support: ${STARTUP_PLIST}"
+  log "Startup config path: $(startup_config_path)"
+}
+
+remove_startup_support() {
+  run_privileged launchctl bootout system "$STARTUP_PLIST" >/dev/null 2>&1 || true
+  run_privileged rm -f "$STARTUP_PLIST"
+  run_privileged rm -f "$(startup_config_path)"
+  log "Removed startup support."
+}
+
+show_startup_support_status() {
+  local cfg_path
+
+  cfg_path="$(startup_config_path)"
+  log "Startup plist: ${STARTUP_PLIST}"
+  if startup_installed; then
+    log "Startup installed: yes"
+  else
+    log "Startup installed: no"
+  fi
+
+  log "Startup config path: ${cfg_path}"
+  if [[ -f "$cfg_path" ]]; then
+    log "Startup config present: yes"
+  else
+    log "Startup config present: no"
+  fi
+
+  if run_privileged launchctl print "system/${STARTUP_LABEL}" >/dev/null 2>&1; then
+    log "launchd job loaded: yes"
+  else
+    log "launchd job loaded: no"
+  fi
+}
+
+run_startup_support() {
+  local cfg_path
+
+  is_root || die "--startup-run must be executed as root by launchd."
+  cfg_path="$(startup_config_path)"
+  [[ -f "$cfg_path" ]] || die "Startup config does not exist: $cfg_path"
+
+  TUNNEL_NAME="$MANAGED_TUNNEL_NAME"
+  run_wg_quick up "$cfg_path"
+  log "Startup tunnel is up: $cfg_path"
 }
 
 write_config() {
@@ -383,9 +695,11 @@ write_config() {
 
   cp "$src" "$dst"
   chmod 600 "$dst"
+  normalize_config_allowed_ips "$dst"
+  sync_startup_config "$dst"
 
   if command -v wg-quick >/dev/null 2>&1; then
-    if [[ "$(uname -s)" == "Darwin" ]] && ! sudo -n true >/dev/null 2>&1; then
+    if [[ "$(uname -s)" == "Darwin" ]] && ! is_root && ! sudo -n true >/dev/null 2>&1; then
       log "Skipping wg-quick validation because passwordless sudo is unavailable in this shell."
     else
       WG_QUICK_USERSPACE_IMPLEMENTATION="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}" \
@@ -416,12 +730,16 @@ run_wg_quick() {
   wg_go="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}"
   [[ -n "$wg_go" ]] || die "wireguard-go is required on macOS but was not found."
 
-  sudo env PATH="$PATH" WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick "$action" "$cfg"
+  if [[ "$action" == "up" ]]; then
+    run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick down "$cfg" >/dev/null 2>&1 || true
+  fi
+
+  run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick "$action" "$cfg"
 }
 
 show_status() {
   ensure_cli_tools
-  sudo env PATH="$PATH" wg show
+  run_privileged_env wg show
 }
 
 parse_args() {
@@ -461,6 +779,7 @@ parse_args() {
         ;;
       --tunnel-name)
         TUNNEL_NAME=${2:-}
+        TUNNEL_NAME_EXPLICIT=1
         shift 2
         ;;
       --target-dir)
@@ -481,6 +800,22 @@ parse_args() {
         ;;
       --status)
         SHOW_STATUS=1
+        shift
+        ;;
+      --startup-install)
+        STARTUP_INSTALL=1
+        shift
+        ;;
+      --startup-remove)
+        STARTUP_REMOVE=1
+        shift
+        ;;
+      --startup-status)
+        STARTUP_STATUS=1
+        shift
+        ;;
+      --startup-run)
+        STARTUP_RUN=1
         shift
         ;;
       --force)
@@ -509,17 +844,29 @@ validate_actions() {
   count=$((count + BRING_UP))
   count=$((count + BRING_DOWN))
   count=$((count + SHOW_STATUS))
+  count=$((count + STARTUP_INSTALL))
+  count=$((count + STARTUP_REMOVE))
+  count=$((count + STARTUP_STATUS))
+  count=$((count + STARTUP_RUN))
 
   if (( count > 1 )); then
-    die "Use at most one of --up, --down, or --status."
+    die "Use exactly one primary action."
   fi
 
   if [[ -n "$CONFIG_FILE" && -n "$CONFIG_BASE64" ]]; then
     die "Use only one of --config-file or --config-base64."
   fi
 
-  if (( SHOW_STATUS == 1 )) && [[ -n "$CONFIG_FILE$CONFIG_BASE64$TUNNEL_NAME" ]]; then
-    die "--status does not take config input or tunnel name."
+  if (( SHOW_STATUS == 1 || STARTUP_STATUS == 1 )) && [[ -n "$CONFIG_FILE$CONFIG_BASE64" || "$TUNNEL_NAME_EXPLICIT" -eq 1 ]]; then
+    die "Status actions do not take config input or tunnel name."
+  fi
+
+  if (( STARTUP_REMOVE == 1 )) && [[ -n "$CONFIG_FILE$CONFIG_BASE64$WG_EASY_API_URL$WG_EASY_API_USER$WG_EASY_API_PASSWORD$WG_EASY_CLIENT_ID$WG_EASY_CLIENT_NAME" || "$TUNNEL_NAME_EXPLICIT" -eq 1 ]]; then
+    die "--startup-remove does not take config input, fetch options, or tunnel name."
+  fi
+
+  if (( STARTUP_RUN == 1 )) && [[ -n "$CONFIG_FILE$CONFIG_BASE64$WG_EASY_API_URL$WG_EASY_API_USER$WG_EASY_API_PASSWORD$WG_EASY_CLIENT_ID$WG_EASY_CLIENT_NAME" || "$TUNNEL_NAME_EXPLICIT" -eq 1 ]]; then
+    die "--startup-run does not take config input, fetch options, or tunnel name."
   fi
 
   if have_wg_easy_fetch; then
@@ -548,7 +895,7 @@ validate_actions() {
       die "Use either local config input or wg-easy fetch options, not both."
     fi
 
-    if (( SHOW_STATUS == 1 || BRING_DOWN == 1 )); then
+    if (( SHOW_STATUS == 1 || BRING_DOWN == 1 || STARTUP_REMOVE == 1 || STARTUP_STATUS == 1 || STARTUP_RUN == 1 )); then
       die "wg-easy fetch options can only be used for saving a config or bringing it up."
     fi
   fi
@@ -558,6 +905,7 @@ main() {
   local tmp_config=""
   local cfg_path=""
   local raw_defaults=0
+  local existing_cfg=""
 
   require_macos
   if (( $# == 0 )); then
@@ -565,14 +913,38 @@ main() {
   fi
   parse_args "$@"
   if (( raw_defaults == 1 )); then
-    TUNNEL_NAME="MaxdeMacBook-Ai"
-    BRING_UP=1
-    log "No arguments supplied; defaulting to --tunnel-name ${TUNNEL_NAME} --up"
+    apply_default_fetch_settings
+    STARTUP_INSTALL=1
+    FORCE=1
+    log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, and --startup-install"
   fi
+
+  existing_cfg="${TARGET_DIR}/${MANAGED_TUNNEL_NAME}.conf"
+  if (( STARTUP_INSTALL == 1 )) && [[ -z "$CONFIG_FILE$CONFIG_BASE64$WG_EASY_API_URL$WG_EASY_API_USER$WG_EASY_API_PASSWORD$WG_EASY_CLIENT_ID$WG_EASY_CLIENT_NAME" ]] && [[ ! -f "$existing_cfg" ]]; then
+    apply_default_fetch_settings
+    FORCE=1
+    log "No existing managed config found; defaulting startup install to fetch the managed client config."
+  fi
+
   validate_actions
+
+  if (( STARTUP_RUN == 1 )); then
+    run_startup_support
+    exit 0
+  fi
 
   if (( SHOW_STATUS == 1 )); then
     show_status
+    exit 0
+  fi
+
+  if (( STARTUP_STATUS == 1 )); then
+    show_startup_support_status
+    exit 0
+  fi
+
+  if (( STARTUP_REMOVE == 1 )); then
+    remove_startup_support
     exit 0
   fi
 
@@ -580,7 +952,7 @@ main() {
     fetch_wg_easy_config_to_temp
     tmp_config="$FETCHED_WG_EASY_TMP"
     trap 'rm -f "${tmp_config:-}"' EXIT
-    if (( INSTALL_TOOLS == 1 || BRING_UP == 1 )); then
+    if (( INSTALL_TOOLS == 1 || BRING_UP == 1 || STARTUP_INSTALL == 1 )); then
       ensure_cli_tools
     fi
     write_config "$tmp_config"
@@ -588,7 +960,7 @@ main() {
   elif [[ -n "$CONFIG_FILE" || -n "$CONFIG_BASE64" ]]; then
     tmp_config="$(read_config_to_temp)"
     trap 'rm -f "${tmp_config:-}"' EXIT
-    if (( INSTALL_TOOLS == 1 || BRING_UP == 1 )); then
+    if (( INSTALL_TOOLS == 1 || BRING_UP == 1 || STARTUP_INSTALL == 1 )); then
       ensure_cli_tools
     fi
     write_config "$tmp_config"
@@ -596,20 +968,29 @@ main() {
   else
     if tmp_config="$(read_config_to_temp 2>/dev/null)"; then
       trap 'rm -f "${tmp_config:-}"' EXIT
-      if (( INSTALL_TOOLS == 1 || BRING_UP == 1 )); then
+      if (( INSTALL_TOOLS == 1 || BRING_UP == 1 || STARTUP_INSTALL == 1 )); then
         ensure_cli_tools
       fi
       write_config "$tmp_config"
       cfg_path="$(existing_config_or_die)"
     else
       cfg_path="$(existing_config_or_die)"
-      if (( INSTALL_TOOLS == 1 || BRING_UP == 1 || BRING_DOWN == 1 )); then
+      if (( INSTALL_TOOLS == 1 || BRING_UP == 1 || BRING_DOWN == 1 || STARTUP_INSTALL == 1 )); then
         ensure_cli_tools
       fi
       if (( PRINT_PATH == 1 )); then
         printf '%s\n' "$cfg_path"
       fi
     fi
+  fi
+
+  if (( STARTUP_INSTALL == 1 || BRING_UP == 1 )); then
+    normalize_config_allowed_ips "$cfg_path"
+  fi
+
+  if (( STARTUP_INSTALL == 1 )); then
+    install_startup_support "$cfg_path"
+    exit 0
   fi
 
   if (( BRING_UP == 1 )); then

@@ -8,6 +8,8 @@ The script installs Docker if needed, writes a compose stack under `/opt/wg-easy
 
 - `deploy_server.sh`: unattended installer and updater for the `wg-easy` stack
 - `deploy_client.sh`: macOS client helper for saving a `wg-easy` client config and optionally bringing it up with `wg-quick`
+- `wg_show.sh`: macOS helper for showing active local WireGuard interfaces and targets
+- `cancel_all_wireguard.sh`: macOS helper for tearing down all active local WireGuard interfaces
 - `test_client.sh`: verification helper for checking local client tooling and remote `wg-easy` UI/API health
 
 ## What the Script Does
@@ -70,7 +72,7 @@ Supported environment variables:
 - `WG_EASY_DNS`: client DNS list, default `1.1.1.1,8.8.8.8`
 - `WG_EASY_IPV4_CIDR`: VPN IPv4 subnet, default `10.8.0.0/24`
 - `WG_EASY_IPV6_CIDR`: VPN IPv6 subnet, default `fd00:dead:beef::/64`
-- `WG_EASY_ALLOWED_IPS`: client allowed IPs, default `0.0.0.0/0,::/0`
+- `WG_EASY_ALLOWED_IPS`: client allowed IPs, default the same as `WG_EASY_IPV4_CIDR` (for example `10.8.0.0/24`)
 - `WG_EASY_STACK_DIR`: stack root, default `/opt/wg-easy`
 - `WG_EASY_PROXY_URL`: proxy URL, default `http://127.0.0.1:11066`
 - `WG_EASY_PROXY_MODE`: `auto`, `always`, or `never`, default `auto`
@@ -85,6 +87,8 @@ After deployment, check:
 - `/opt/wg-easy/data/` for persistent `wg-easy` state
 
 The repo itself does not store runtime secrets unless you copy them here manually.
+
+When you rerun `deploy_server.sh`, it rewrites `/opt/wg-easy/.env` from the resolved settings. That means the current default for `WG_EASY_ALLOWED_IPS` will replace the old full-tunnel default unless you explicitly override `WG_EASY_ALLOWED_IPS`.
 
 ## Operations
 
@@ -138,7 +142,27 @@ By default, `./test_client.sh` expects `wg-easy` to contain a client matching th
 
 Use `wg-easy` to create a client and either download its `.conf` file manually or let the macOS helper fetch it directly from the `wg-easy` API. If you specify `--wg-easy-client-name` and that client does not exist yet, the helper creates it automatically before downloading the config. If you omit both `--wg-easy-client-name` and `--wg-easy-client-id`, the helper defaults to this Mac's local host name.
 
-A bare `bash ./deploy_client.sh` now defaults to `--tunnel-name MaxdeMacBook-Ai --up`.
+`deploy_client.sh` now manages exactly one local WireGuard tunnel: `wg_mk`. It accepts only client configs in the `10.8.0.0/24` VPN prefix, rewrites peer `AllowedIPs` to `10.8.0.0/24`, and always writes the local config to `~/.config/wireguard/wg_mk.conf`.
+
+A bare `bash ./deploy_client.sh` now uses the hardcoded `wg-easy` server at `http://39.96.200.42:51821`, the `admin` account, this Mac's local host name as the server-side client name, `--force`, and `--startup-install`. That installs a `launchd` job and loads it immediately so the managed tunnel comes back after reboot.
+
+To make the WireGuard client survive a reboot, install startup support with launchd:
+
+```bash
+./deploy_client.sh --startup-install
+```
+
+Check startup state later:
+
+```bash
+./deploy_client.sh --startup-status
+```
+
+Remove startup support:
+
+```bash
+./deploy_client.sh --startup-remove
+```
 
 Save the config only:
 
@@ -155,7 +179,33 @@ Save the config and bring the tunnel up with Homebrew-installed CLI tools:
 Bring an existing saved tunnel down later:
 
 ```bash
-./deploy_client.sh --tunnel-name macbook --down
+./deploy_client.sh --tunnel-name wg_mk --down
+```
+
+Show current local WireGuard status:
+
+```bash
+./wg_show.sh
+```
+
+Stop every active local WireGuard interface on the Mac:
+
+```bash
+./cancel_all_wireguard.sh
+```
+
+That now also removes the managed `launchd` startup support for `wg_mk`, so the tunnel stays down after reboot.
+
+Preview what it would stop first:
+
+```bash
+./cancel_all_wireguard.sh --dry-run
+```
+
+If you only want a temporary stop and want the managed tunnel to come back after reboot, keep startup support installed:
+
+```bash
+./cancel_all_wireguard.sh --keep-startup
 ```
 
 Fetch a client config directly from `wg-easy` by exact client name and bring it up. If `macbook` does not exist yet, it will be created first:
@@ -166,17 +216,20 @@ WG_EASY_API_PASSWORD='your-password' \
   --wg-easy-url https://vpn.example.com:51821 \
   --wg-easy-user admin \
   --wg-easy-client-name macbook \
+  --tunnel-name wg_mk \
   --up
 ```
 
 Fetch or create the client that matches this Mac automatically:
 
 ```bash
-WG_EASY_API_PASSWORD='your-password' \
-./deploy_client.sh \
-  --wg-easy-url http://39.96.200.42:51821 \
-  --wg-easy-user admin \
-  --print-config-path
+bash ./deploy_client.sh
+```
+
+Bring the managed tunnel up for the current session only, without installing reboot persistence:
+
+```bash
+./deploy_client.sh --up
 ```
 
 Fetch by numeric client ID instead:
@@ -199,11 +252,16 @@ Notes for API fetch mode:
 - Upstream `wg-easy` currently uses Basic Authentication for the API.
 - Accounts with 2FA enabled cannot use the API; disable 2FA for the account you use here.
 - Prefer `WG_EASY_API_PASSWORD` in the environment over `--wg-easy-password` to avoid shell history leakage.
-- If the fetched client name is too long for `wg-quick`, the helper truncates the local tunnel name automatically. Use `--tunnel-name` to override it explicitly.
+- macOS WireGuard interfaces show up as `utunN` in `ifconfig`, not as `wg0`.
+- `--tunnel-name` is restricted to `wg_mk` so the helper manages only one local tunnel for this VPN.
+- `deploy_client.sh` rewrites peer `AllowedIPs` to `10.8.0.0/24` even if an older server or saved client profile still says `0.0.0.0/0,::/0`.
+- `--startup-install` writes a root-owned startup config to `/usr/local/etc/wireguard/wg_mk.conf`, installs `/Library/LaunchDaemons/com.mk.wg_mk.client.plist`, carries the current tool `PATH` into the `launchd` job, and loads it immediately so the tunnel also survives the next reboot.
 - If a `bin/` directory exists next to the scripts, both `deploy_client.sh` and `test_client.sh` add it to `PATH` automatically. This is useful on Macs where you want to carry `wg`, `wg-quick`, and `wireguard-go` inside `/Users/mk/code/wg_mk/bin`.
 - If a `lib/` directory exists next to the scripts, both client-side scripts export it through `DYLD_LIBRARY_PATH`. This is useful when you carry a repo-local `bash` and its shared libraries for `wg-quick` on a stock macOS install.
 - Both client-side scripts are compatible with the stock `/bin/bash` shipped by macOS.
 - On macOS shells without passwordless `sudo`, the helper still saves and validates the config structure, but it skips the extra `wg-quick strip` validation. Bringing the tunnel up or down still requires interactive `sudo` or the official WireGuard app.
+- `cancel_all_wireguard.sh` targets real WireGuard interfaces from `wg show interfaces`. It tries clean `wg-quick down` shutdown first, falls back to stopping `wireguard-go` and lingering `wg-quick up` processes only if needed, and removes the managed `launchd` startup support by default so `wg_mk` does not come back after reboot.
+- `wg_show.sh` is the read-only companion to `cancel_all_wireguard.sh`; it prints active WireGuard interfaces, the WireGuard interface IPs bound to them, discovered `wg-quick up` targets, and raw `wg show` output.
 
 ## Changing the Public Host After First Boot
 

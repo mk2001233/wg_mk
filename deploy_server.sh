@@ -154,7 +154,7 @@ configure_docker_proxy() {
 
 apt_install_base() {
   apt_no_proxy update
-  apt_no_proxy install -y ca-certificates curl openssl iproute2
+  apt_no_proxy install -y ca-certificates curl iproute2
 }
 
 install_base_packages() {
@@ -265,7 +265,7 @@ set_defaults() {
   : "${WG_EASY_VPN_PORT:=51820}"
   : "${WG_EASY_UI_PORT:=51821}"
   : "${WG_EASY_ADMIN_USER:=admin}"
-  : "${WG_EASY_ADMIN_PASSWORD:=$(openssl rand -hex 18)}"
+  : "${WG_EASY_ADMIN_PASSWORD:=71082aaa348e3b03d45bf7f6a2c41ef18fe3}"
   : "${WG_EASY_DNS:=1.1.1.1,8.8.8.8}"
   : "${WG_EASY_IPV4_CIDR:=10.8.0.0/24}"
   : "${WG_EASY_IPV6_CIDR:=fd00:dead:beef::/64}"

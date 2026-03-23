@@ -39,13 +39,13 @@ The script installs Docker if needed, writes a compose stack under `/opt/wg-easy
 Run with defaults:
 
 ```bash
-sudo ./deploy_server.sh
+bash deploy_server.sh
 ```
 
 Run with an explicit public IP:
 
 ```bash
-sudo WG_EASY_PUBLIC_HOST=39.96.200.42 ./deploy_server.sh
+WG_EASY_PUBLIC_HOST=39.96.200.42 WG_EASY_PROXY_URL=http://127.0.0.1:11096 bash deploy_server.sh
 ```
 
 Force the local proxy from the start:

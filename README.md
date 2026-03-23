@@ -18,6 +18,7 @@ The script installs Docker if needed, writes a compose stack under `/opt/wg-easy
 - Installs Docker Engine and the Docker Compose plugin
 - Clears inherited shell proxy variables by default so normal apt traffic stays direct
 - Falls back to `http://127.0.0.1:11066` when Docker download or image pull paths fail or hang
+- Persists an explicit same-interface `FORWARD` accept rule for `wg0` so WireGuard peers can reach each other reliably
 - Writes:
   - `/opt/wg-easy/.env`
   - `/opt/wg-easy/docker-compose.yml`
@@ -89,6 +90,8 @@ After deployment, check:
 The repo itself does not store runtime secrets unless you copy them here manually.
 
 When you rerun `deploy_server.sh`, it rewrites `/opt/wg-easy/.env` from the resolved settings. That means the current default for `WG_EASY_ALLOWED_IPS` will replace the old full-tunnel default unless you explicitly override `WG_EASY_ALLOWED_IPS`.
+
+The script also repairs `wg-easy`'s persisted WireGuard hooks in `/opt/wg-easy/data/wg-easy.db` so `wg0` gets a top-of-chain `iptables -I FORWARD -i wg0 -o wg0 -j ACCEPT` rule, plus the matching IPv6 and teardown rules. It also applies the live rule directly without restarting the container, which avoids dropping the current peer endpoint state.
 
 ## Operations
 

@@ -3,12 +3,14 @@ set -Eeuo pipefail
 
 STACK_DIR="${WG_EASY_STACK_DIR:-/opt/wg-easy}"
 DATA_DIR="${STACK_DIR}/data"
+DB_FILE="${DATA_DIR}/wg-easy.db"
 ENV_FILE="${STACK_DIR}/.env"
 COMPOSE_FILE="${STACK_DIR}/docker-compose.yml"
 INFO_FILE="${STACK_DIR}/deployment-info.txt"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-easy.conf"
 DOCKER_PROXY_FILE="/etc/systemd/system/docker.service.d/http-proxy.conf"
 CONTAINERD_PROXY_FILE="/etc/systemd/system/containerd.service.d/http-proxy.conf"
+WG_INTERFACE_NAME="wg0"
 
 PROXY_URL="${WG_EASY_PROXY_URL:-http://127.0.0.1:11066}"
 PROXY_MODE="${WG_EASY_PROXY_MODE:-auto}"
@@ -159,7 +161,7 @@ configure_docker_proxy() {
 
 apt_install_base() {
   apt_no_proxy update
-  apt_no_proxy install -y ca-certificates curl iproute2
+  apt_no_proxy install -y ca-certificates curl iproute2 python3
 }
 
 install_base_packages() {
@@ -425,6 +427,84 @@ wait_for_http() {
   return 1
 }
 
+ensure_peer_forward_hooks() {
+  local hook_state
+
+  [[ -f "$DB_FILE" ]] || die "Expected wg-easy database at ${DB_FILE}."
+  command_exists python3 || die "python3 is required to update ${DB_FILE}."
+
+  hook_state="$(
+    WG_EASY_DB_FILE="$DB_FILE" WG_EASY_WG_INTERFACE="$WG_INTERFACE_NAME" python3 - <<'PY'
+import os
+import sqlite3
+import sys
+
+db_file = os.environ["WG_EASY_DB_FILE"]
+wg_interface = os.environ["WG_EASY_WG_INTERFACE"]
+
+post_up_rules = [
+    f"iptables -I FORWARD -i {wg_interface} -o {wg_interface} -j ACCEPT;",
+    f"ip6tables -I FORWARD -i {wg_interface} -o {wg_interface} -j ACCEPT;",
+]
+post_down_rules = [
+    f"iptables -D FORWARD -i {wg_interface} -o {wg_interface} -j ACCEPT;",
+    f"ip6tables -D FORWARD -i {wg_interface} -o {wg_interface} -j ACCEPT;",
+]
+
+conn = sqlite3.connect(db_file)
+cur = conn.cursor()
+cur.execute("SELECT post_up, post_down FROM hooks_table WHERE id = ?", (wg_interface,))
+row = cur.fetchone()
+
+if row is None:
+    print("missing")
+    sys.exit(0)
+
+post_up, post_down = row
+original = (post_up, post_down)
+
+for rule in reversed(post_up_rules):
+    if rule not in post_up:
+        post_up = f"{rule} {post_up}".strip()
+
+for rule in reversed(post_down_rules):
+    if rule not in post_down:
+        post_down = f"{rule} {post_down}".strip()
+
+if (post_up, post_down) != original:
+    cur.execute(
+        "UPDATE hooks_table SET post_up = ?, post_down = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (post_up, post_down, wg_interface),
+    )
+    conn.commit()
+    print("updated")
+else:
+    print("unchanged")
+PY
+  )"
+
+  case "$hook_state" in
+    updated)
+      log "Updated wg-easy hooks to allow peer-to-peer forwarding on ${WG_INTERFACE_NAME}."
+      ;;
+    unchanged)
+      ;;
+    missing)
+      die "wg-easy hooks table did not contain interface ${WG_INTERFACE_NAME}."
+      ;;
+    *)
+      die "Unexpected wg-easy hook update state: ${hook_state}"
+      ;;
+  esac
+
+  docker exec wg-easy sh -lc "
+    iptables -C FORWARD -i ${WG_INTERFACE_NAME} -o ${WG_INTERFACE_NAME} -j ACCEPT 2>/dev/null ||
+      iptables -I FORWARD -i ${WG_INTERFACE_NAME} -o ${WG_INTERFACE_NAME} -j ACCEPT
+    ip6tables -C FORWARD -i ${WG_INTERFACE_NAME} -o ${WG_INTERFACE_NAME} -j ACCEPT 2>/dev/null ||
+      ip6tables -I FORWARD -i ${WG_INTERFACE_NAME} -o ${WG_INTERFACE_NAME} -j ACCEPT
+  " >/dev/null
+}
+
 write_info_file() {
   cat >"$INFO_FILE" <<EOF
 wg-easy deployment
@@ -454,6 +534,7 @@ main() {
   prepare_stack
   start_stack
   wait_for_http "http://127.0.0.1:${WG_EASY_UI_PORT}" 60 2 || die "wg-easy did not become ready on port ${WG_EASY_UI_PORT}."
+  ensure_peer_forward_hooks
   write_info_file
 
   log "Deployment complete."

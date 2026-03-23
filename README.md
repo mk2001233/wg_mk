@@ -45,7 +45,7 @@ bash deploy_server.sh
 Run with an explicit public IP:
 
 ```bash
-WG_EASY_PUBLIC_HOST=39.96.200.42 WG_EASY_PROXY_URL=http://127.0.0.1:11096 bash deploy_server.sh
+WG_EASY_PUBLIC_HOST=123.57.216.161 WG_EASY_PROXY_URL=http://127.0.0.1:11096 bash deploy_server.sh
 ```
 
 Force the local proxy from the start:
@@ -64,7 +64,7 @@ sudo WG_EASY_PULL_TIMEOUT_SECONDS=300 ./deploy_server.sh
 
 Supported environment variables:
 
-- `WG_EASY_PUBLIC_HOST`: public IP or DNS name advertised to clients
+- `WG_EASY_PUBLIC_HOST`: public IP or DNS name advertised to clients, default `123.57.216.161`
 - `WG_EASY_VPN_PORT`: WireGuard UDP port, default `51820`
 - `WG_EASY_UI_PORT`: web UI TCP port, default `51821`
 - `WG_EASY_ADMIN_USER`: bootstrap admin username, default `admin`
@@ -122,7 +122,7 @@ Run the deployment verifier from a machine that can reach the `wg-easy` UI:
 Override the target or credentials when needed:
 
 ```bash
-WG_EASY_TEST_URL=http://39.96.200.42:51821 \
+WG_EASY_TEST_URL=http://123.57.216.161:51821 \
 WG_EASY_TEST_USER=admin \
 WG_EASY_TEST_PASSWORD='your-password' \
 ./test_client.sh
@@ -144,7 +144,7 @@ Use `wg-easy` to create a client and either download its `.conf` file manually o
 
 `deploy_client.sh` now manages exactly one local WireGuard tunnel: `wg_mk`. It accepts only client configs in the `10.8.0.0/24` VPN prefix, rewrites peer `AllowedIPs` to `10.8.0.0/24`, and always writes the local config to `~/.config/wireguard/wg_mk.conf`.
 
-A bare `bash ./deploy_client.sh` now uses the hardcoded `wg-easy` server at `http://39.96.200.42:51821`, the `admin` account, this Mac's local host name as the server-side client name, `--force`, and `--startup-install`. That installs a `launchd` job and loads it immediately so the managed tunnel comes back after reboot.
+A bare `bash ./deploy_client.sh` now uses the hardcoded `wg-easy` server at `http://123.57.216.161:51821`, the `admin` account, this Mac's local host name as the server-side client name, `--force`, and `--startup-install`. That installs a `launchd` job and loads it immediately so the managed tunnel comes back after reboot.
 
 To make the WireGuard client survive a reboot, install startup support with launchd:
 

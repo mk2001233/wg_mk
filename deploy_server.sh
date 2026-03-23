@@ -281,7 +281,7 @@ set_defaults() {
     WG_EASY_ALLOWED_IPS="${WG_EASY_IPV4_CIDR}"
   fi
 
-  : "${WG_EASY_PUBLIC_HOST:=$(detect_public_host)}"
+  : "${WG_EASY_PUBLIC_HOST:=123.57.216.161}"
 }
 
 validate_settings() {

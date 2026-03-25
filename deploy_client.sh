@@ -16,6 +16,7 @@ MANAGED_IPV4_PREFIX="10.8.0."
 MANAGED_IPV4_CIDR="10.8.0.0/24"
 MANAGED_ALLOWED_IPS="${MANAGED_IPV4_CIDR}"
 MANAGED_IPV6_PREFIX="fd00:dead:beef:"
+MANAGED_PERSISTENT_KEEPALIVE=25
 DEFAULT_WG_EASY_URL="http://123.57.216.161:51821"
 DEFAULT_WG_EASY_USER="admin"
 DEFAULT_WG_EASY_PASSWORD="71082aaa348e3b03d45bf7f6a2c41ef18fe3"
@@ -81,6 +82,7 @@ It accepts only client configs in:
 
 It rewrites peer AllowedIPs to:
   ${MANAGED_ALLOWED_IPS}
+and ensures PersistentKeepalive = ${MANAGED_PERSISTENT_KEEPALIVE} to prevent tunnel sleep.
 
 Config input:
   --config-file PATH        Read client config from a .conf file
@@ -360,6 +362,41 @@ normalize_config_allowed_ips() {
   fi
 }
 
+normalize_config_keepalive() {
+  local path=$1
+  local tmp
+
+  if grep -Eq '^[[:space:]]*PersistentKeepalive[[:space:]]*=' "$path"; then
+    # Already has a PersistentKeepalive line — update it
+    tmp="$(mktemp)"
+    awk -v ka="$MANAGED_PERSISTENT_KEEPALIVE" '
+      /^[[:space:]]*PersistentKeepalive[[:space:]]*=/ {
+        print "PersistentKeepalive = " ka
+        next
+      }
+      { print }
+    ' "$path" >"$tmp"
+    mv "$tmp" "$path"
+  else
+    # No PersistentKeepalive — append it after the last line of [Peer]
+    tmp="$(mktemp)"
+    awk -v ka="$MANAGED_PERSISTENT_KEEPALIVE" '
+      /^[[:space:]]*\[Peer\]/ { in_peer = 1 }
+      in_peer && /^[[:space:]]*$/ {
+        print "PersistentKeepalive = " ka
+        in_peer = 0
+      }
+      { print }
+      END {
+        if (in_peer) print "PersistentKeepalive = " ka
+      }
+    ' "$path" >"$tmp"
+    mv "$tmp" "$path"
+  fi
+
+  log "Ensured PersistentKeepalive = ${MANAGED_PERSISTENT_KEEPALIVE}"
+}
+
 startup_installed() {
   [[ -f "$STARTUP_PLIST" ]]
 }
@@ -404,6 +441,7 @@ read_config_to_temp() {
   mv "${tmp}.lf" "$tmp"
 
   normalize_config_allowed_ips "$tmp"
+  normalize_config_keepalive "$tmp"
   validate_config_file "$tmp"
 
   printf '%s\n' "$tmp"
@@ -529,6 +567,7 @@ fetch_wg_easy_config_to_temp() {
   tr -d '\r' <"$tmp" >"${tmp}.lf"
   mv "${tmp}.lf" "$tmp"
   normalize_config_allowed_ips "$tmp"
+  normalize_config_keepalive "$tmp"
   validate_config_file "$tmp"
 
   FETCHED_WG_EASY_TMP="$tmp"
@@ -696,6 +735,7 @@ write_config() {
   cp "$src" "$dst"
   chmod 600 "$dst"
   normalize_config_allowed_ips "$dst"
+  normalize_config_keepalive "$dst"
   sync_startup_config "$dst"
 
   if command -v wg-quick >/dev/null 2>&1; then
@@ -984,9 +1024,8 @@ main() {
     fi
   fi
 
-  if (( STARTUP_INSTALL == 1 || BRING_UP == 1 )); then
-    normalize_config_allowed_ips "$cfg_path"
-  fi
+  normalize_config_allowed_ips "$cfg_path"
+  normalize_config_keepalive "$cfg_path"
 
   if (( STARTUP_INSTALL == 1 )); then
     install_startup_support "$cfg_path"

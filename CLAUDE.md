@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-A WireGuard VPN deployment suite built around [wg-easy](https://github.com/wg-easy/wg-easy). Server-side targets Ubuntu+Docker; client-side targets macOS with `wg-quick` and launchd persistence.
+A WireGuard VPN deployment suite built around [wg-easy](https://github.com/wg-easy/wg-easy). Server-side targets Ubuntu+Docker; client-side targets macOS and Linux (Ubuntu) with `wg-quick` and platform-native persistence (launchd on macOS, systemd on Linux).
 
 ## Validate Changes
 
@@ -24,15 +24,15 @@ There are no automated tests beyond `test_client.sh`, which is a live integratio
 
 **Server (`deploy_server.sh`):** Installs Docker, generates a Compose stack at `/opt/wg-easy`, starts wg-easy, and persists peer-to-peer forwarding hooks (iptables rules) in wg-easy's SQLite database via Python. Live iptables rules are applied through `docker exec` to avoid container restarts that would lose peer endpoint state.
 
-**Client (`deploy_client.sh`):** Fetches or reads a WireGuard config, normalizes it (rewrites `AllowedIPs` to `10.8.0.0/24`, enforces `PersistentKeepalive = 25`), writes it to `~/.config/wireguard/wg_mk.conf`, and optionally installs a launchd startup job and brings the tunnel up. Config can come from file, base64, stdin, or the wg-easy API.
+**Client (`deploy_client.sh`):** Fetches or reads a WireGuard config, normalizes it (rewrites `AllowedIPs` to `10.8.0.0/24`, enforces `PersistentKeepalive = 25`), writes it to `~/.config/wireguard/wg_mk.conf`, and optionally installs a startup job (launchd on macOS, systemd on Linux) and brings the tunnel up. Config can come from file, base64, stdin, or the wg-easy API. On macOS uses Homebrew + wireguard-go; on Linux uses apt + kernel WireGuard.
 
 **Utilities:** `wg_show.sh` (read-only status), `cancel_all_wireguard.sh` (teardown all interfaces), `test_client.sh` (health checks against wg-easy API).
 
 ## Key Conventions
 
 - Single managed tunnel name: `wg_mk`. The client script refuses to manage other tunnel names.
-- All scripts support repo-local `./bin/` and `./lib/` directories injected into PATH/DYLD_LIBRARY_PATH for portable tool distribution.
-- Logging prefixes: `[wg-easy]` (server), `[macos-wg]` (client), `[wg-easy-test]` (test), `[wg-stop-all]` (cancel), `[wg-show]` (show). All log to stderr except `wg_show.sh`.
+- All scripts support repo-local `./bin/` and `./lib/` directories injected into PATH/DYLD_LIBRARY_PATH (macOS) or LD_LIBRARY_PATH (Linux) for portable tool distribution.
+- Logging prefixes: `[wg-easy]` (server), `[wg-client]` (client), `[wg-easy-test]` (test), `[wg-stop-all]` (cancel), `[wg-show]` (show). All log to stderr except `wg_show.sh`.
 - Default server: `123.57.216.161` with wg-easy on ports 51820 (WireGuard UDP) / 51821 (Web UI TCP).
 
 ## Non-Obvious Behaviors

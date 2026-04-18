@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Ensure Homebrew bin is first in PATH so wg-quick finds bash 4+ on macOS
-if [[ -d /opt/homebrew/bin ]]; then
+OS_KERNEL="$(uname -s)"
+case "$OS_KERNEL" in
+  Darwin) PLATFORM=darwin ;;
+  Linux)  PLATFORM=linux ;;
+  *)      printf '[wg-client] ERROR: Unsupported platform: %s. This script supports macOS and Linux.\n' "$OS_KERNEL" >&2; exit 1 ;;
+esac
+
+if [[ "$PLATFORM" == "darwin" && -d /opt/homebrew/bin ]]; then
   export PATH="/opt/homebrew/bin:$PATH"
 fi
 
@@ -10,12 +16,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 USER_HOME="${HOME:-}"
 if [[ -z "$USER_HOME" ]]; then
-  USER_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    USER_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+  else
+    USER_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+  fi
 fi
 if [[ -z "$USER_HOME" ]]; then
-  USER_HOME="/var/root"
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    USER_HOME="/var/root"
+  else
+    USER_HOME="/root"
+  fi
 fi
-TARGET_DIR="${WG_MACOS_CONFIG_DIR:-$USER_HOME/.config/wireguard}"
+TARGET_DIR="${WG_CLIENT_CONFIG_DIR:-${WG_MACOS_CONFIG_DIR:-$USER_HOME/.config/wireguard}}"
 MANAGED_TUNNEL_NAME="wg_mk"
 MANAGED_IPV4_PREFIX="10.8.0."
 MANAGED_IPV4_CIDR="10.8.0.0/24"
@@ -26,11 +40,20 @@ DEFAULT_WG_EASY_URL="http://123.57.216.161:51821"
 DEFAULT_WG_EASY_USER="admin"
 DEFAULT_WG_EASY_PASSWORD="71082aaa348e3b03d45bf7f6a2c41ef18fe3"
 STARTUP_LABEL="com.mk.wg_mk.client"
-STARTUP_PLIST="/Library/LaunchDaemons/${STARTUP_LABEL}.plist"
 STARTUP_LOG_DIR="/var/log/wg_mk"
 STARTUP_STDOUT_LOG="${STARTUP_LOG_DIR}/client-startup.log"
 STARTUP_STDERR_LOG="${STARTUP_LOG_DIR}/client-startup.err"
-STARTUP_SYSTEM_CONFIG_DIR="/usr/local/etc/wireguard"
+
+if [[ "$PLATFORM" == "darwin" ]]; then
+  STARTUP_PLIST="/Library/LaunchDaemons/${STARTUP_LABEL}.plist"
+  STARTUP_SYSTEM_CONFIG_DIR="/usr/local/etc/wireguard"
+  LIB_PATH_VAR="DYLD_LIBRARY_PATH"
+else
+  STARTUP_SERVICE_FILE="/etc/systemd/system/${STARTUP_LABEL}.service"
+  STARTUP_SYSTEM_CONFIG_DIR="/etc/wireguard"
+  LIB_PATH_VAR="LD_LIBRARY_PATH"
+fi
+
 TUNNEL_NAME=""
 TUNNEL_NAME_EXPLICIT=0
 CONFIG_FILE=""
@@ -60,8 +83,8 @@ if [[ -d "${SCRIPT_DIR}/bin" ]]; then
 fi
 
 if [[ -d "${SCRIPT_DIR}/lib" ]]; then
-  DYLD_LIBRARY_PATH="${SCRIPT_DIR}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
-  export DYLD_LIBRARY_PATH
+  eval "${LIB_PATH_VAR}=\"${SCRIPT_DIR}/lib\${${LIB_PATH_VAR}:+:\${${LIB_PATH_VAR}}}\""
+  export "${LIB_PATH_VAR}"
 fi
 
 usage() {
@@ -69,9 +92,12 @@ usage() {
 Usage:
   ${SCRIPT_NAME} [options]
 
-Write a macOS WireGuard client config from a wg-easy-generated .conf file,
+Write a WireGuard client config from a wg-easy-generated .conf file,
 optionally fetch it directly from a wg-easy server or create it there first,
-optionally install CLI tools via Homebrew, and optionally bring the tunnel up.
+optionally install CLI tools, and optionally bring the tunnel up.
+
+Supports macOS and Linux (Ubuntu). On macOS uses launchd for persistence;
+on Linux uses systemd.
 
 With no arguments, the script defaults to:
   --wg-easy-url ${DEFAULT_WG_EASY_URL}
@@ -110,11 +136,11 @@ Config target:
   --print-config-path       Print the final config path after writing/resolving it
 
 Actions:
-  --install-tools           Install wireguard-tools with Homebrew if needed
+  --install-tools           Install wireguard-tools if needed (Homebrew on macOS, apt on Linux)
   --up                      Bring the tunnel up after writing or from an existing config
   --down                    Bring an existing tunnel down
   --status                  Show current WireGuard status
-  --startup-install         Install startup support with launchd and load it now
+  --startup-install         Install startup support (launchd on macOS, systemd on Linux)
   --startup-remove          Remove startup support
   --startup-status          Show startup support state
   -h, --help                Show this help
@@ -134,28 +160,30 @@ EOF
 }
 
 log() {
-  printf '[macos-wg] %s\n' "$*" >&2
+  printf '[wg-client] %s\n' "$*" >&2
 }
 
 die() {
-  printf '[macos-wg] ERROR: %s\n' "$*" >&2
+  printf '[wg-client] ERROR: %s\n' "$*" >&2
   exit 1
-}
-
-require_macos() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "This script is intended to run on macOS."
 }
 
 is_root() {
   [[ "$(id -u)" -eq 0 ]]
 }
 
+get_lib_path_value() {
+  eval "printf '%s' \"\${${LIB_PATH_VAR}:-}\""
+}
+
 run_env() {
   local -a env_args
+  local lib_val
   env_args=(env "PATH=${PATH}")
 
-  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
-    env_args+=("DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}")
+  lib_val="$(get_lib_path_value)"
+  if [[ -n "$lib_val" ]]; then
+    env_args+=("${LIB_PATH_VAR}=${lib_val}")
   fi
 
   "${env_args[@]}" "$@"
@@ -177,10 +205,12 @@ run_privileged_env() {
   fi
 
   local -a env_args
+  local lib_val
   env_args=(env "PATH=${PATH}")
 
-  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
-    env_args+=("DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}")
+  lib_val="$(get_lib_path_value)"
+  if [[ -n "$lib_val" ]]; then
+    env_args+=("${LIB_PATH_VAR}=${lib_val}")
   fi
 
   sudo "${env_args[@]}" "$@"
@@ -199,7 +229,7 @@ xml_escape() {
 default_local_client_name() {
   local name=""
 
-  if [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ "$PLATFORM" == "darwin" ]]; then
     name="$(scutil --get LocalHostName 2>/dev/null || true)"
   fi
 
@@ -242,6 +272,14 @@ decode_base64() {
 }
 
 ensure_cli_tools() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    ensure_cli_tools_darwin
+  else
+    ensure_cli_tools_linux
+  fi
+}
+
+ensure_cli_tools_darwin() {
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1 && command -v wireguard-go >/dev/null 2>&1; then
     return 0
   fi
@@ -256,6 +294,18 @@ ensure_cli_tools() {
   command -v wg >/dev/null 2>&1 || die "wg was not found after Homebrew installation."
   command -v wg-quick >/dev/null 2>&1 || die "wg-quick was not found after Homebrew installation."
   command -v wireguard-go >/dev/null 2>&1 || die "wireguard-go was not found after Homebrew installation."
+}
+
+ensure_cli_tools_linux() {
+  if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "wireguard-tools not found; installing automatically via apt"
+  run_privileged apt-get update
+  run_privileged apt-get install -y wireguard-tools
+  command -v wg >/dev/null 2>&1 || die "wg was not found after apt installation."
+  command -v wg-quick >/dev/null 2>&1 || die "wg-quick was not found after apt installation."
 }
 
 sanitize_tunnel_name() {
@@ -372,7 +422,6 @@ normalize_config_keepalive() {
   local tmp
 
   if grep -Eq '^[[:space:]]*PersistentKeepalive[[:space:]]*=' "$path"; then
-    # Already has a PersistentKeepalive line — update it
     tmp="$(mktemp)"
     awk -v ka="$MANAGED_PERSISTENT_KEEPALIVE" '
       /^[[:space:]]*PersistentKeepalive[[:space:]]*=/ {
@@ -383,7 +432,6 @@ normalize_config_keepalive() {
     ' "$path" >"$tmp"
     mv "$tmp" "$path"
   else
-    # No PersistentKeepalive — append it after the last line of [Peer]
     tmp="$(mktemp)"
     awk -v ka="$MANAGED_PERSISTENT_KEEPALIVE" '
       /^[[:space:]]*\[Peer\]/ { in_peer = 1 }
@@ -403,7 +451,11 @@ normalize_config_keepalive() {
 }
 
 startup_installed() {
-  [[ -f "$STARTUP_PLIST" ]]
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    [[ -f "$STARTUP_PLIST" ]]
+  else
+    [[ -f "$STARTUP_SERVICE_FILE" ]]
+  fi
 }
 
 apply_default_fetch_settings() {
@@ -420,7 +472,6 @@ stdin_to_temp() {
 
   [[ -t 0 ]] && return 1
 
-  # Avoid treating an attached-but-empty stdin pipe as a config source.
   IFS= read -r -n 1 -t 0 first_byte || return 1
   printf '%s' "$first_byte" >"$tmp"
   cat >>"$tmp"
@@ -656,7 +707,51 @@ EOF
 EOF
 }
 
+write_startup_unit() {
+  local tmp=$1
+  local script_path
+  local lib_val
+
+  script_path="${SCRIPT_DIR}/deploy_client.sh"
+  lib_val="$(get_lib_path_value)"
+
+  cat >"$tmp" <<EOF
+[Unit]
+Description=WireGuard client tunnel (${MANAGED_TUNNEL_NAME})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=${PATH}
+EOF
+
+  if [[ -n "$lib_val" ]]; then
+    printf 'Environment=%s=%s\n' "$LIB_PATH_VAR" "$lib_val" >>"$tmp"
+  fi
+
+  cat >>"$tmp" <<EOF
+ExecStart=/bin/bash ${script_path} --startup-run
+ExecStop=$(command -v wg-quick) down $(startup_config_path)
+WorkingDirectory=${SCRIPT_DIR}
+StandardOutput=append:${STARTUP_STDOUT_LOG}
+StandardError=append:${STARTUP_STDERR_LOG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 install_startup_support() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    install_startup_support_darwin "$@"
+  else
+    install_startup_support_linux "$@"
+  fi
+}
+
+install_startup_support_darwin() {
   local cfg_path=$1
   local tmp
 
@@ -680,14 +775,58 @@ install_startup_support() {
   log "Startup config path: $(startup_config_path)"
 }
 
+install_startup_support_linux() {
+  local cfg_path=$1
+  local tmp
+
+  sync_startup_config "$cfg_path"
+
+  tmp="$(mktemp)"
+  write_startup_unit "$tmp"
+
+  run_privileged install -d -m 755 "$STARTUP_LOG_DIR"
+  run_privileged install -m 644 "$tmp" "$STARTUP_SERVICE_FILE"
+  rm -f "$tmp"
+
+  run_privileged systemctl daemon-reload
+  run_privileged systemctl enable --now "${STARTUP_LABEL}.service"
+
+  log "Installed startup support: ${STARTUP_SERVICE_FILE}"
+  log "Startup config path: $(startup_config_path)"
+}
+
 remove_startup_support() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    remove_startup_support_darwin
+  else
+    remove_startup_support_linux
+  fi
+}
+
+remove_startup_support_darwin() {
   run_privileged launchctl bootout system "$STARTUP_PLIST" >/dev/null 2>&1 || true
   run_privileged rm -f "$STARTUP_PLIST"
   run_privileged rm -f "$(startup_config_path)"
   log "Removed startup support."
 }
 
+remove_startup_support_linux() {
+  run_privileged systemctl disable --now "${STARTUP_LABEL}.service" >/dev/null 2>&1 || true
+  run_privileged rm -f "$STARTUP_SERVICE_FILE"
+  run_privileged rm -f "$(startup_config_path)"
+  run_privileged systemctl daemon-reload
+  log "Removed startup support."
+}
+
 show_startup_support_status() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    show_startup_support_status_darwin
+  else
+    show_startup_support_status_linux
+  fi
+}
+
+show_startup_support_status_darwin() {
   local cfg_path
 
   cfg_path="$(startup_config_path)"
@@ -712,10 +851,41 @@ show_startup_support_status() {
   fi
 }
 
+show_startup_support_status_linux() {
+  local cfg_path
+
+  cfg_path="$(startup_config_path)"
+  log "Startup unit: ${STARTUP_SERVICE_FILE}"
+  if startup_installed; then
+    log "Startup installed: yes"
+  else
+    log "Startup installed: no"
+  fi
+
+  log "Startup config path: ${cfg_path}"
+  if [[ -f "$cfg_path" ]]; then
+    log "Startup config present: yes"
+  else
+    log "Startup config present: no"
+  fi
+
+  if run_privileged systemctl is-enabled "${STARTUP_LABEL}.service" >/dev/null 2>&1; then
+    log "systemd unit enabled: yes"
+  else
+    log "systemd unit enabled: no"
+  fi
+
+  if run_privileged systemctl is-active "${STARTUP_LABEL}.service" >/dev/null 2>&1; then
+    log "systemd unit active: yes"
+  else
+    log "systemd unit active: no"
+  fi
+}
+
 run_startup_support() {
   local cfg_path
 
-  is_root || die "--startup-run must be executed as root by launchd."
+  is_root || die "--startup-run must be executed as root by the init system."
   cfg_path="$(startup_config_path)"
   [[ -f "$cfg_path" ]] || die "Startup config does not exist: $cfg_path"
 
@@ -744,11 +914,13 @@ write_config() {
   sync_startup_config "$dst"
 
   if command -v wg-quick >/dev/null 2>&1; then
-    if [[ "$(uname -s)" == "Darwin" ]] && ! is_root && ! sudo -n true >/dev/null 2>&1; then
+    if ! is_root && ! sudo -n true >/dev/null 2>&1; then
       log "Skipping wg-quick validation because passwordless sudo is unavailable in this shell."
-    else
+    elif [[ "$PLATFORM" == "darwin" ]]; then
       WG_QUICK_USERSPACE_IMPLEMENTATION="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}" \
         wg-quick strip "$dst" >/dev/null || die "Saved config failed wg-quick validation."
+    else
+      wg-quick strip "$dst" >/dev/null || die "Saved config failed wg-quick validation."
     fi
   fi
 
@@ -769,17 +941,26 @@ existing_config_or_die() {
 run_wg_quick() {
   local action=$1
   local cfg=$2
-  local wg_go
 
   ensure_cli_tools
-  wg_go="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}"
-  [[ -n "$wg_go" ]] || die "wireguard-go is required on macOS but was not found."
 
-  if [[ "$action" == "up" ]]; then
-    run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick down "$cfg" >/dev/null 2>&1 || true
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local wg_go
+    wg_go="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}"
+    [[ -n "$wg_go" ]] || die "wireguard-go is required on macOS but was not found."
+
+    if [[ "$action" == "up" ]]; then
+      run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick down "$cfg" >/dev/null 2>&1 || true
+    fi
+
+    run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick "$action" "$cfg"
+  else
+    if [[ "$action" == "up" ]]; then
+      run_privileged_env wg-quick down "$cfg" >/dev/null 2>&1 || true
+    fi
+
+    run_privileged_env wg-quick "$action" "$cfg"
   fi
-
-  run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick "$action" "$cfg"
 }
 
 show_status() {
@@ -894,6 +1075,10 @@ validate_actions() {
   count=$((count + STARTUP_STATUS))
   count=$((count + STARTUP_RUN))
 
+  if (( BRING_UP == 1 && STARTUP_INSTALL == 1 )); then
+    count=$((count - 1))
+  fi
+
   if (( count > 1 )); then
     die "Use exactly one primary action."
   fi
@@ -952,7 +1137,6 @@ main() {
   local raw_defaults=0
   local existing_cfg=""
 
-  require_macos
   if (( $# == 0 )); then
     raw_defaults=1
   fi
@@ -960,8 +1144,10 @@ main() {
   if (( raw_defaults == 1 )); then
     apply_default_fetch_settings
     STARTUP_INSTALL=1
+    BRING_UP=1
     FORCE=1
-    log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, and --startup-install"
+    INSTALL_TOOLS=1
+    log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, --startup-install, and --up"
   fi
 
   existing_cfg="${TARGET_DIR}/${MANAGED_TUNNEL_NAME}.conf"
@@ -1034,7 +1220,9 @@ main() {
 
   if (( STARTUP_INSTALL == 1 )); then
     install_startup_support "$cfg_path"
-    exit 0
+    if (( BRING_UP != 1 )); then
+      exit 0
+    fi
   fi
 
   if (( BRING_UP == 1 )); then
@@ -1049,7 +1237,11 @@ main() {
     exit 0
   fi
 
-  log "Next step: import $cfg_path into the official WireGuard macOS app, or re-run with --up to use wg-quick."
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    log "Next step: import $cfg_path into the official WireGuard macOS app, or re-run with --up to use wg-quick."
+  else
+    log "Next step: re-run with --up to use wg-quick, or use --startup-install for boot persistence."
+  fi
 }
 
 main "$@"

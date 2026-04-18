@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+OS_KERNEL="$(uname -s)"
+case "$OS_KERNEL" in
+  Darwin) PLATFORM=darwin ;;
+  Linux)  PLATFORM=linux ;;
+  *)      printf '[wg-show] ERROR: Unsupported platform: %s. This script supports macOS and Linux.\n' "$OS_KERNEL" >&2; exit 1 ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 
@@ -10,8 +17,13 @@ if [[ -d "${SCRIPT_DIR}/bin" ]]; then
 fi
 
 if [[ -d "${SCRIPT_DIR}/lib" ]]; then
-  DYLD_LIBRARY_PATH="${SCRIPT_DIR}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
-  export DYLD_LIBRARY_PATH
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    DYLD_LIBRARY_PATH="${SCRIPT_DIR}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+    export DYLD_LIBRARY_PATH
+  else
+    LD_LIBRARY_PATH="${SCRIPT_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export LD_LIBRARY_PATH
+  fi
 fi
 
 usage() {
@@ -19,7 +31,7 @@ usage() {
 Usage:
   ${SCRIPT_NAME} [options]
 
-Show local WireGuard status on macOS.
+Show local WireGuard status on macOS and Linux.
 
 The script prints:
   - active WireGuard interfaces from wg(8)
@@ -39,10 +51,6 @@ log() {
 die() {
   printf '[wg-show] ERROR: %s\n' "$*" >&2
   exit 1
-}
-
-require_macos() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "This script is intended to run on macOS."
 }
 
 ensure_cli_tools() {
@@ -80,12 +88,21 @@ discover_wg_quick_targets() {
 show_interface_addresses() {
   local iface=$1
 
-  ifconfig "$iface" 2>/dev/null |
-    awk '
-      $1 == "inet" { print "wireguard-ipv4 " $2; next }
-      $1 == "inet6" && $2 !~ /^fe80:/ { print "wireguard-ipv6 " $2; next }
-      $1 == "inet6" && $2 ~ /^fe80:/ { print "link-local-ipv6 " $2 }
-    '
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    ifconfig "$iface" 2>/dev/null |
+      awk '
+        $1 == "inet" { print "wireguard-ipv4 " $2; next }
+        $1 == "inet6" && $2 !~ /^fe80:/ { print "wireguard-ipv6 " $2; next }
+        $1 == "inet6" && $2 ~ /^fe80:/ { print "link-local-ipv6 " $2 }
+      '
+  else
+    ip addr show "$iface" 2>/dev/null |
+      awk '
+        $1 == "inet"  { split($2, a, "/"); print "wireguard-ipv4 " a[1]; next }
+        $1 == "inet6" && $2 !~ /^fe80:/ { split($2, a, "/"); print "wireguard-ipv6 " a[1]; next }
+        $1 == "inet6" && $2 ~ /^fe80:/ { split($2, a, "/"); print "link-local-ipv6 " a[1] }
+      '
+  fi
 }
 
 show_status() {
@@ -151,7 +168,6 @@ parse_args() {
 }
 
 main() {
-  require_macos
   parse_args "$@"
   ensure_cli_tools
   show_status

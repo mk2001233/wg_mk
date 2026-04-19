@@ -73,6 +73,7 @@ SHOW_STATUS=0
 FORCE=0
 PRINT_PATH=0
 STARTUP_INSTALL=0
+NO_STARTUP=0
 STARTUP_REMOVE=0
 STARTUP_STATUS=0
 STARTUP_RUN=0
@@ -140,7 +141,8 @@ Actions:
   --up                      Bring the tunnel up after writing or from an existing config
   --down                    Bring an existing tunnel down
   --status                  Show current WireGuard status
-  --startup-install         Install startup support (launchd on macOS, systemd on Linux)
+  --startup-install         Install startup support (launchd on macOS, systemd on Linux) [default]
+  --no-startup              Skip automatic startup install
   --startup-remove          Remove startup support
   --startup-status          Show startup support state
   -h, --help                Show this help
@@ -153,7 +155,7 @@ Examples:
   cat ./macbook.conf | ${SCRIPT_NAME} --tunnel-name ${MANAGED_TUNNEL_NAME} --up
   ${SCRIPT_NAME} --tunnel-name ${MANAGED_TUNNEL_NAME} --down
   ${SCRIPT_NAME}
-  ${SCRIPT_NAME} --startup-install
+  ${SCRIPT_NAME} --config-file ./macbook.conf --no-startup --up
   ${SCRIPT_NAME} --startup-status
   ${SCRIPT_NAME} --status
 EOF
@@ -1032,6 +1034,10 @@ parse_args() {
         STARTUP_INSTALL=1
         shift
         ;;
+      --no-startup)
+        NO_STARTUP=1
+        shift
+        ;;
       --startup-remove)
         STARTUP_REMOVE=1
         shift
@@ -1143,11 +1149,15 @@ main() {
   parse_args "$@"
   if (( raw_defaults == 1 )); then
     apply_default_fetch_settings
-    STARTUP_INSTALL=1
     BRING_UP=1
     FORCE=1
     INSTALL_TOOLS=1
-    log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, --startup-install, and --up"
+    log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, --up"
+  fi
+
+  if (( NO_STARTUP == 0 && STARTUP_INSTALL == 0 && STARTUP_REMOVE == 0 && STARTUP_STATUS == 0 && STARTUP_RUN == 0 && BRING_DOWN == 0 && SHOW_STATUS == 0 )); then
+    STARTUP_INSTALL=1
+    log "Defaulting to --startup-install (boot persistence)."
   fi
 
   existing_cfg="${TARGET_DIR}/${MANAGED_TUNNEL_NAME}.conf"
@@ -1240,7 +1250,7 @@ main() {
   if [[ "$PLATFORM" == "darwin" ]]; then
     log "Next step: import $cfg_path into the official WireGuard macOS app, or re-run with --up to use wg-quick."
   else
-    log "Next step: re-run with --up to use wg-quick, or use --startup-install for boot persistence."
+    log "Next step: re-run with --up to use wg-quick. Boot persistence is already installed by default."
   fi
 }
 

@@ -24,7 +24,7 @@ There are no automated tests beyond `test_client.sh`, which is a live integratio
 
 **Server (`deploy_server.sh`):** Installs Docker, generates a Compose stack at `/opt/wg-easy`, starts wg-easy, and persists peer-to-peer forwarding hooks (iptables rules) in wg-easy's SQLite database via Python. Live iptables rules are applied through `docker exec` to avoid container restarts that would lose peer endpoint state.
 
-**Client (`deploy_client.sh`):** Fetches or reads a WireGuard config, normalizes it (rewrites `AllowedIPs` to `10.8.0.0/24`, enforces `PersistentKeepalive = 25`), writes it to `~/.config/wireguard/wg_mk.conf`, and optionally installs a startup job (launchd on macOS, systemd on Linux) and brings the tunnel up. Config can come from file, base64, stdin, or the wg-easy API. On macOS uses Homebrew + wireguard-go; on Linux uses apt + kernel WireGuard.
+**Client (`deploy_client.sh`):** Fetches or reads a WireGuard config, normalizes it (rewrites `AllowedIPs` to `10.8.0.0/24`, enforces `PersistentKeepalive = 25`), writes it to `~/.config/wireguard/wg_mk.conf`, and installs a startup job by default (launchd on macOS, systemd on Linux) and brings the tunnel up. Use `--no-startup` to skip automatic startup install. Config can come from file, base64, stdin, or the wg-easy API. On macOS uses Homebrew + wireguard-go; on Linux uses apt + kernel WireGuard.
 
 **Utilities:** `wg_show.sh` (read-only status), `cancel_all_wireguard.sh` (teardown all interfaces), `test_client.sh` (health checks against wg-easy API).
 

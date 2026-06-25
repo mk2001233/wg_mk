@@ -10,12 +10,16 @@ INFO_FILE="${STACK_DIR}/deployment-info.txt"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-easy.conf"
 DOCKER_PROXY_FILE="/etc/systemd/system/docker.service.d/http-proxy.conf"
 CONTAINERD_PROXY_FILE="/etc/systemd/system/containerd.service.d/http-proxy.conf"
+APT_PROXY_FILE="/etc/apt/apt.conf.d/99-wg-easy-proxy"
+APT_SOURCES_FILE="/etc/apt/sources.list"
+APT_DEB822_FILE="/etc/apt/sources.list.d/ubuntu.sources"
 WG_INTERFACE_NAME="wg0"
 
 PROXY_URL="${WG_EASY_PROXY_URL:-http://127.0.0.1:11066}"
 PROXY_MODE="${WG_EASY_PROXY_MODE:-auto}"
 PULL_TIMEOUT_SECONDS="${WG_EASY_PULL_TIMEOUT_SECONDS:-900}"
 SHELL_PROXY_ENABLED=0
+PROXY_ACTIVE=0
 WG_EASY_ALLOWED_IPS_EXPLICIT=0
 
 if [[ -n "${WG_EASY_ALLOWED_IPS+x}" ]]; then
@@ -66,12 +70,19 @@ validate_timeout() {
   fi
 }
 
+# Authority (host[:port]) after stripping the scheme and any user:pass@ userinfo.
+# Strip up to the LAST '@' and the path so credentials that contain '@', ':' or
+# '/' cannot bleed into the host/port.
+proxy_authority() {
+  printf '%s' "$PROXY_URL" | sed -E 's#^[A-Za-z]+://##; s#^.*@##; s#/.*$##'
+}
+
 proxy_host() {
-  printf '%s' "$PROXY_URL" | sed -E 's#^[A-Za-z]+://([^:/]+).*#\1#'
+  proxy_authority | sed -E 's#:[0-9]+$##'
 }
 
 proxy_port() {
-  printf '%s' "$PROXY_URL" | sed -nE 's#^[A-Za-z]+://[^:/]+:([0-9]+).*#\1#p'
+  proxy_authority | sed -nE 's#^.*:([0-9]+)$#\1#p'
 }
 
 proxy_reachable() {
@@ -83,7 +94,14 @@ proxy_reachable() {
     return 1
   fi
 
-  timeout 3 bash -lc "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+  # Never re-evaluate these as shell: require a plain host/IP and numeric port,
+  # then pass them as positional args so the probe cannot run embedded code.
+  if ! [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    log "Ignoring proxy with a malformed host/port parsed from PROXY_URL."
+    return 1
+  fi
+
+  timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1
 }
 
 enable_shell_proxy() {
@@ -132,12 +150,15 @@ maybe_enable_shell_proxy() {
 
 write_proxy_dropin() {
   local target_file=$1
+  local proxy_escaped
+  # systemd expands $VAR / ${VAR} in Environment=; a literal '$' must be '$$'.
+  proxy_escaped="$(printf '%s' "$PROXY_URL" | sed 's/\$/$$/g')"
   mkdir -p "$(dirname "$target_file")"
   cat >"$target_file" <<EOF
 [Service]
-Environment="HTTP_PROXY=${PROXY_URL}"
-Environment="HTTPS_PROXY=${PROXY_URL}"
-Environment="ALL_PROXY=${PROXY_URL}"
+Environment="HTTP_PROXY=${proxy_escaped}"
+Environment="HTTPS_PROXY=${proxy_escaped}"
+Environment="ALL_PROXY=${proxy_escaped}"
 Environment="NO_PROXY=127.0.0.1,localhost,::1"
 EOF
 }
@@ -155,6 +176,72 @@ configure_docker_proxy() {
       systemctl restart containerd docker
       log "Configured Docker and containerd to use proxy ${PROXY_URL}"
       return 0
+      ;;
+  esac
+}
+
+write_apt_proxy() {
+  mkdir -p "$(dirname "$APT_PROXY_FILE")"
+  cat >"$APT_PROXY_FILE" <<EOF
+Acquire::http::Proxy "${PROXY_URL}";
+Acquire::https::Proxy "${PROXY_URL}";
+EOF
+  chmod 644 "$APT_PROXY_FILE"
+  log "Configured apt to use proxy ${PROXY_URL}"
+}
+
+# Replace the distro mirror with the official Ubuntu mirrors. Cloud images often
+# ship a provider-internal mirror (e.g. mirrors.cloud.aliyuncs.com) that is only
+# reachable over the intranet; when we route apt through an external proxy we
+# need mirrors the proxy can actually reach.
+use_official_ubuntu_sources() {
+  local codename backup
+
+  codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+  [[ -n "$codename" ]] || die "Could not determine Ubuntu codename for official apt sources."
+
+  # Move aside a deb822 ubuntu.sources so it cannot reintroduce the old mirror.
+  if [[ -f "$APT_DEB822_FILE" ]]; then
+    mv -f "$APT_DEB822_FILE" "${APT_DEB822_FILE}.wg-easy.bak"
+  fi
+
+  if [[ -f "$APT_SOURCES_FILE" ]] && ! grep -q 'wg-easy: official Ubuntu mirrors' "$APT_SOURCES_FILE"; then
+    backup="${APT_SOURCES_FILE}.wg-easy.bak"
+    [[ -f "$backup" ]] || cp -a "$APT_SOURCES_FILE" "$backup"
+  fi
+
+  cat >"$APT_SOURCES_FILE" <<EOF
+# wg-easy: official Ubuntu mirrors (reachable via proxy)
+deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${codename}-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
+EOF
+  log "Switched apt sources to official Ubuntu mirrors (${codename}); original saved to ${APT_SOURCES_FILE}.wg-easy.bak"
+}
+
+# Decide once how dependencies are fetched. In 'always' mode we commit to the
+# proxy for everything: official Ubuntu mirrors + apt proxy + shell proxy (curl)
+# + (later) the Docker daemon proxy. 'auto' enables the proxy only when it is
+# reachable and otherwise stays direct; 'never' never touches it.
+setup_proxy() {
+  case "$PROXY_MODE" in
+    never)
+      disable_shell_proxy
+      return 0
+      ;;
+    always)
+      proxy_reachable || die "Proxy mode is 'always' but ${PROXY_URL} is not reachable."
+      enable_shell_proxy
+      use_official_ubuntu_sources
+      write_apt_proxy
+      PROXY_ACTIVE=1
+      log "Proxy active: apt, Docker repo, and image pulls will all use ${PROXY_URL}."
+      ;;
+    auto)
+      # Stay direct by default; the apt/curl/docker fallbacks enable the proxy
+      # on demand if a direct fetch fails (see maybe_enable_shell_proxy).
+      disable_shell_proxy
       ;;
   esac
 }
@@ -309,6 +396,35 @@ ensure_wireguard_module() {
   modprobe -n -v wireguard >/dev/null 2>&1 || die "WireGuard kernel module is not available on this host."
 }
 
+# Remove a CONFLICTING pre-existing host WireGuard interface before starting
+# wg-easy. The wg-easy tunnel lives inside the container, so its wg0 is in a
+# separate netns and is never listed here. To avoid disturbing an unrelated host
+# tunnel the admin may run, we only tear down an interface that actually
+# conflicts: one bound to the wg-easy VPN port (when wg(8) is available to read
+# it) or, as a fallback, one using the wg-easy interface name.
+teardown_conflicting_interfaces() {
+  command_exists ip || return 0
+
+  local link port
+  while IFS= read -r link; do
+    [[ -n "$link" ]] || continue
+
+    if command_exists wg; then
+      port="$(wg show "$link" listen-port 2>/dev/null || true)"
+      if [[ -n "$port" ]]; then
+        [[ "$port" == "$WG_EASY_VPN_PORT" ]] || continue
+      else
+        [[ "$link" == "$WG_INTERFACE_NAME" ]] || continue
+      fi
+    else
+      [[ "$link" == "$WG_INTERFACE_NAME" ]] || continue
+    fi
+
+    log "Removing conflicting host WireGuard interface: ${link} (listen-port ${port:-unknown})"
+    wg-quick down "$link" >/dev/null 2>&1 || ip link delete "$link" >/dev/null 2>&1 || true
+  done < <(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+}
+
 configure_host_sysctl() {
   cat >"$SYSCTL_FILE" <<'EOF'
 net.ipv4.ip_forward=1
@@ -387,6 +503,7 @@ prepare_stack() {
   mkdir -p "$DATA_DIR"
   chmod 700 "$DATA_DIR"
   load_existing_env
+  apply_cli_overrides
   set_defaults
   validate_settings
   if [[ ! -f "$ENV_FILE" ]]; then
@@ -505,6 +622,97 @@ PY
   " >/dev/null
 }
 
+usage() {
+  cat <<EOF
+Usage:
+  ${0##*/} [options]
+
+Deploy wg-easy on this host. Every setting can be provided as a flag below or as
+the matching WG_EASY_* environment variable. Precedence, highest first: a flag,
+then values already saved in ${ENV_FILE} (reused on redeploy), then a matching
+WG_EASY_* environment variable, then the built-in default. Run as root.
+
+Server settings:
+  --public-host VALUE      Public IP/hostname clients connect to (WG_EASY_PUBLIC_HOST)
+  --vpn-port VALUE         WireGuard UDP port (WG_EASY_VPN_PORT)
+  --ui-port VALUE          Web UI TCP port (WG_EASY_UI_PORT)
+  --admin-user VALUE       Admin username (WG_EASY_ADMIN_USER)
+  --admin-password VALUE   Admin password (WG_EASY_ADMIN_PASSWORD)
+  --dns VALUE              DNS servers, comma-separated (WG_EASY_DNS)
+  --ipv4-cidr VALUE        VPN IPv4 CIDR (WG_EASY_IPV4_CIDR)
+  --ipv6-cidr VALUE        VPN IPv6 CIDR (WG_EASY_IPV6_CIDR)
+  --allowed-ips VALUE      AllowedIPs pushed to clients (WG_EASY_ALLOWED_IPS)
+
+Image pull / proxy:
+  --proxy-url VALUE        Fallback proxy URL (WG_EASY_PROXY_URL)
+  --proxy-mode VALUE       auto|always|never (WG_EASY_PROXY_MODE)
+  --pull-timeout VALUE     Image pull timeout in seconds, >= 30 (WG_EASY_PULL_TIMEOUT_SECONDS)
+
+  -h, --help               Show this help
+
+Examples:
+  sudo bash ${0##*/} --public-host 203.0.113.10
+  sudo bash ${0##*/} --public-host vpn.example.com --vpn-port 51820 --ui-port 51821
+  sudo bash ${0##*/} --public-host 203.0.113.10 --admin-password 's3cret' --dns 1.1.1.1
+  sudo bash ${0##*/} --public-host 203.0.113.10 --proxy-mode always --proxy-url http://127.0.0.1:11066
+EOF
+}
+
+require_value() {
+  [[ -n "${2:-}" ]] || die "Option $1 requires a value."
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --public-host|--host|--server-ip)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_PUBLIC_HOST="$2"; shift 2 ;;
+      --vpn-port)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_VPN_PORT="$2"; shift 2 ;;
+      --ui-port)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_UI_PORT="$2"; shift 2 ;;
+      --admin-user)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_ADMIN_USER="$2"; shift 2 ;;
+      --admin-password)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_ADMIN_PASSWORD="$2"; shift 2 ;;
+      --dns)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_DNS="$2"; shift 2 ;;
+      --ipv4-cidr)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_IPV4_CIDR="$2"; shift 2 ;;
+      --ipv6-cidr)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_IPV6_CIDR="$2"; shift 2 ;;
+      --allowed-ips)
+        require_value "$1" "${2:-}"; CLI_WG_EASY_ALLOWED_IPS="$2"; shift 2 ;;
+      --proxy-url)
+        require_value "$1" "${2:-}"; PROXY_URL="$2"; shift 2 ;;
+      --proxy-mode)
+        require_value "$1" "${2:-}"; PROXY_MODE="$2"; shift 2 ;;
+      --pull-timeout)
+        require_value "$1" "${2:-}"; PULL_TIMEOUT_SECONDS="$2"; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        die "Unknown argument: $1 (see --help)." ;;
+    esac
+  done
+}
+
+apply_cli_overrides() {
+  [[ -n "${CLI_WG_EASY_PUBLIC_HOST+x}" ]] && WG_EASY_PUBLIC_HOST="$CLI_WG_EASY_PUBLIC_HOST"
+  [[ -n "${CLI_WG_EASY_VPN_PORT+x}" ]] && WG_EASY_VPN_PORT="$CLI_WG_EASY_VPN_PORT"
+  [[ -n "${CLI_WG_EASY_UI_PORT+x}" ]] && WG_EASY_UI_PORT="$CLI_WG_EASY_UI_PORT"
+  [[ -n "${CLI_WG_EASY_ADMIN_USER+x}" ]] && WG_EASY_ADMIN_USER="$CLI_WG_EASY_ADMIN_USER"
+  [[ -n "${CLI_WG_EASY_ADMIN_PASSWORD+x}" ]] && WG_EASY_ADMIN_PASSWORD="$CLI_WG_EASY_ADMIN_PASSWORD"
+  [[ -n "${CLI_WG_EASY_DNS+x}" ]] && WG_EASY_DNS="$CLI_WG_EASY_DNS"
+  [[ -n "${CLI_WG_EASY_IPV4_CIDR+x}" ]] && WG_EASY_IPV4_CIDR="$CLI_WG_EASY_IPV4_CIDR"
+  [[ -n "${CLI_WG_EASY_IPV6_CIDR+x}" ]] && WG_EASY_IPV6_CIDR="$CLI_WG_EASY_IPV6_CIDR"
+  if [[ -n "${CLI_WG_EASY_ALLOWED_IPS+x}" ]]; then
+    WG_EASY_ALLOWED_IPS="$CLI_WG_EASY_ALLOWED_IPS"
+    WG_EASY_ALLOWED_IPS_EXPLICIT=1
+  fi
+  return 0
+}
+
 write_info_file() {
   cat >"$INFO_FILE" <<EOF
 wg-easy deployment
@@ -521,17 +729,20 @@ EOF
 }
 
 main() {
+  parse_args "$@"
   require_root
   validate_proxy_mode
   validate_timeout
-  if [[ "$PROXY_MODE" != "always" ]]; then
-    disable_shell_proxy
-  fi
+  setup_proxy
   ensure_wireguard_module
   install_base_packages
   install_docker
   configure_host_sysctl
+  teardown_conflicting_interfaces
   prepare_stack
+  if [[ "$PROXY_MODE" == "always" ]]; then
+    configure_docker_proxy || true
+  fi
   start_stack
   wait_for_http "http://127.0.0.1:${WG_EASY_UI_PORT}" 60 2 || die "wg-easy did not become ready on port ${WG_EASY_UI_PORT}."
   ensure_peer_forward_hooks

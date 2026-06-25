@@ -63,6 +63,8 @@ WG_EASY_API_USER="${WG_EASY_API_USER:-}"
 WG_EASY_API_PASSWORD="${WG_EASY_API_PASSWORD:-}"
 WG_EASY_CLIENT_ID=""
 WG_EASY_CLIENT_NAME=""
+WG_EASY_SERVER_IP=""
+WG_EASY_SERVER_UI_PORT=""
 WG_EASY_API_INSECURE_TLS=0
 FETCHED_WG_EASY_TMP=""
 FETCHED_WG_EASY_CLIENT_NAME=""
@@ -120,6 +122,11 @@ Config input:
   --config-file PATH        Read client config from a .conf file
   --config-base64 STRING    Read client config from a base64-encoded string
                             If neither option is set, the script reads config from stdin
+  --server-ip IP            Public IP/hostname of the wg-easy server to fetch from.
+                            Shorthand for --wg-easy-url http://IP:51821 that also
+                            applies the default API user/password unless overridden.
+  --server-host HOST        Alias for --server-ip
+  --server-ui-port PORT     Web UI/API port used with --server-ip (default 51821)
   --wg-easy-url URL         Fetch the config from this wg-easy base URL
   --wg-easy-user USER       wg-easy API username
   --wg-easy-password PASS   wg-easy API password
@@ -148,6 +155,8 @@ Actions:
   -h, --help                Show this help
 
 Examples:
+  ${SCRIPT_NAME} --server-ip 203.0.113.10
+  ${SCRIPT_NAME} --server-ip 203.0.113.10 --server-ui-port 51821 --wg-easy-client-name macbook
   ${SCRIPT_NAME} --config-file ./macbook.conf --install-tools --up
   ${SCRIPT_NAME} --config-file ./macbook.conf --tunnel-name ${MANAGED_TUNNEL_NAME}
   ${SCRIPT_NAME} --config-base64 "\$(base64 < ./macbook.conf | tr -d '\n')" --tunnel-name ${MANAGED_TUNNEL_NAME}
@@ -468,6 +477,30 @@ apply_default_fetch_settings() {
   TUNNEL_NAME="$MANAGED_TUNNEL_NAME"
 }
 
+# Turn --server-ip/--server-host (+ optional --server-ui-port) into a wg-easy API
+# URL and fill in any fetch credentials the caller did not override, so passing
+# just the server's public IP on the command line is enough to fetch a config.
+resolve_server_target() {
+  [[ -n "$WG_EASY_SERVER_IP" ]] || return 0
+
+  if [[ -n "$WG_EASY_API_URL" ]]; then
+    die "Use either --server-ip/--server-host or --wg-easy-url, not both."
+  fi
+
+  case "$WG_EASY_SERVER_IP" in
+    http://*|https://*)
+      WG_EASY_API_URL="${WG_EASY_SERVER_IP%/}"
+      ;;
+    *)
+      WG_EASY_API_URL="http://${WG_EASY_SERVER_IP}:${WG_EASY_SERVER_UI_PORT:-51821}"
+      ;;
+  esac
+
+  WG_EASY_API_USER="${WG_EASY_API_USER:-$DEFAULT_WG_EASY_USER}"
+  WG_EASY_API_PASSWORD="${WG_EASY_API_PASSWORD:-$DEFAULT_WG_EASY_PASSWORD}"
+  WG_EASY_CLIENT_NAME="${WG_EASY_CLIENT_NAME:-$(default_local_client_name)}"
+}
+
 stdin_to_temp() {
   local tmp=$1
   local first_byte=""
@@ -507,7 +540,8 @@ read_config_to_temp() {
 
 curl_wg_easy() {
   local -a args
-  args=(--fail --silent --show-error --user "${WG_EASY_API_USER}:${WG_EASY_API_PASSWORD}")
+  # Fail fast on a wrong port / blocked firewall instead of hanging forever.
+  args=(--fail --silent --show-error --connect-timeout 10 --max-time 60 --user "${WG_EASY_API_USER}:${WG_EASY_API_PASSWORD}")
 
   if [[ "$WG_EASY_API_INSECURE_TLS" -eq 1 ]]; then
     args+=(-k)
@@ -940,27 +974,102 @@ existing_config_or_die() {
   printf '%s\n' "$dst"
 }
 
+# All utun interfaces currently carrying an address in the managed IPv4 prefix
+# (macOS gives WireGuard tunnels dynamic utunN names, so we match by address).
+managed_utuns() {
+  # Reset iface at EVERY interface header (column 0), not just utun headers, so a
+  # managed-prefix address on a later non-utun interface is not mis-attributed to
+  # the previous utun.
+  ifconfig 2>/dev/null | awk -v pfx="$MANAGED_IPV4_PREFIX" '
+    /^[a-zA-Z]/ { iface = "" }
+    /^utun[0-9]/ { iface = $1; sub(/:/, "", iface) }
+    $1 == "inet" && index($2, pfx) == 1 && iface != "" { print iface }
+  ' | awk 'NF && !seen[$0]++'
+}
+
+# Remove every existing instance of the managed tunnel before bringing it up, so
+# a stale or duplicated interface can never collide on the same address. On
+# macOS wg-quick only tracks one utun in <name>.name, so we also destroy any
+# orphaned utun left behind by an earlier race.
+teardown_managed_interfaces() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local wg_go u
+    wg_go="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}"
+
+    run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" \
+      wg-quick down "$MANAGED_TUNNEL_NAME" >/dev/null 2>&1 || true
+
+    while IFS= read -r u; do
+      [[ -n "$u" ]] || continue
+      # Only destroy utuns WireGuard created (they have a control socket); never
+      # an unrelated utun that merely happens to carry a managed-prefix address.
+      [[ -S "/var/run/wireguard/${u}.sock" ]] || continue
+      log "Removing stale ${MANAGED_TUNNEL_NAME} interface ${u}"
+      run_privileged ifconfig "$u" destroy >/dev/null 2>&1 || true
+      run_privileged rm -f "/var/run/wireguard/${u}.sock" >/dev/null 2>&1 || true
+    done < <(managed_utuns)
+
+    run_privileged rm -f "/var/run/wireguard/${MANAGED_TUNNEL_NAME}.name" >/dev/null 2>&1 || true
+  else
+    run_privileged_env wg-quick down "$MANAGED_TUNNEL_NAME" >/dev/null 2>&1 || true
+    run_privileged ip link del "$MANAGED_TUNNEL_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+managed_up() {
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    [[ -n "$(managed_utuns)" ]]
+  else
+    ip link show "$MANAGED_TUNNEL_NAME" >/dev/null 2>&1
+  fi
+}
+
+# The launchd kickstart is asynchronous, so give the boot job time (~15s) to
+# bring the tunnel up before we report the result.
+wait_managed_up() {
+  local i
+  for ((i = 0; i < 30; i++)); do
+    managed_up && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Called when the boot job was installed but the tunnel never appeared. Surface
+# the boot job's own error and fail, rather than letting a down tunnel look like
+# a success.
+startup_bringup_failed() {
+  log "ERROR: ${MANAGED_TUNNEL_NAME} did not come up via the boot job."
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    run_privileged launchctl print "system/${STARTUP_LABEL}" 2>/dev/null \
+      | grep -iE 'state =|last exit' | sed 's/^/  /' || true
+    if [[ -f "$STARTUP_STDERR_LOG" ]]; then
+      log "Recent startup errors (${STARTUP_STDERR_LOG}):"
+      run_privileged tail -n 15 "$STARTUP_STDERR_LOG" 2>/dev/null | sed 's/^/  /' || true
+    fi
+  else
+    run_privileged systemctl --no-pager status "${STARTUP_LABEL}.service" 2>/dev/null \
+      | tail -n 15 | sed 's/^/  /' || true
+  fi
+  die "Boot job failed to bring up ${MANAGED_TUNNEL_NAME}; see ${STARTUP_STDERR_LOG}."
+}
+
 run_wg_quick() {
   local action=$1
   local cfg=$2
 
   ensure_cli_tools
 
+  if [[ "$action" == "up" ]]; then
+    teardown_managed_interfaces
+  fi
+
   if [[ "$PLATFORM" == "darwin" ]]; then
     local wg_go
     wg_go="${WG_QUICK_USERSPACE_IMPLEMENTATION:-$(command -v wireguard-go || true)}"
     [[ -n "$wg_go" ]] || die "wireguard-go is required on macOS but was not found."
-
-    if [[ "$action" == "up" ]]; then
-      run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick down "$cfg" >/dev/null 2>&1 || true
-    fi
-
     run_privileged_env WG_QUICK_USERSPACE_IMPLEMENTATION="$wg_go" wg-quick "$action" "$cfg"
   else
-    if [[ "$action" == "up" ]]; then
-      run_privileged_env wg-quick down "$cfg" >/dev/null 2>&1 || true
-    fi
-
     run_privileged_env wg-quick "$action" "$cfg"
   fi
 }
@@ -999,6 +1108,14 @@ parse_args() {
         ;;
       --wg-easy-client-name)
         WG_EASY_CLIENT_NAME=${2:-}
+        shift 2
+        ;;
+      --server-ip|--server-host)
+        WG_EASY_SERVER_IP=${2:-}
+        shift 2
+        ;;
+      --server-ui-port)
+        WG_EASY_SERVER_UI_PORT=${2:-}
         shift 2
         ;;
       --wg-easy-insecure-tls)
@@ -1147,12 +1264,18 @@ main() {
     raw_defaults=1
   fi
   parse_args "$@"
+  resolve_server_target
   if (( raw_defaults == 1 )); then
     apply_default_fetch_settings
     BRING_UP=1
     FORCE=1
     INSTALL_TOOLS=1
     log "No arguments supplied; defaulting to ${DEFAULT_WG_EASY_URL}, tunnel ${TUNNEL_NAME}, --up"
+  elif [[ -n "$WG_EASY_SERVER_IP" ]] && (( BRING_UP + BRING_DOWN + SHOW_STATUS + STARTUP_INSTALL + STARTUP_REMOVE + STARTUP_STATUS + STARTUP_RUN == 0 )); then
+    BRING_UP=1
+    FORCE=1
+    INSTALL_TOOLS=1
+    log "Targeting wg-easy at ${WG_EASY_API_URL}; defaulting to fetch, --up, and boot persistence."
   fi
 
   if (( NO_STARTUP == 0 && STARTUP_INSTALL == 0 && STARTUP_REMOVE == 0 && STARTUP_STATUS == 0 && STARTUP_RUN == 0 && BRING_DOWN == 0 && SHOW_STATUS == 0 )); then
@@ -1230,9 +1353,15 @@ main() {
 
   if (( STARTUP_INSTALL == 1 )); then
     install_startup_support "$cfg_path"
-    if (( BRING_UP != 1 )); then
-      exit 0
+    # The launchd/systemd job brings the tunnel up (and tears down any existing
+    # wg_mk first). Doing a second manual 'up' here would race the boot job and
+    # could leave two interfaces on the same address, so we stop after install.
+    if wait_managed_up; then
+      log "Tunnel is up via the boot job: $(startup_config_path)"
+    else
+      startup_bringup_failed
     fi
+    exit 0
   fi
 
   if (( BRING_UP == 1 )); then

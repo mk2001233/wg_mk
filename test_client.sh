@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" 2>/dev/null && pwd || true)"
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR="$(pwd)"
 WG_EASY_TEST_URL="${WG_EASY_TEST_URL:-http://123.57.216.161:51821}"
 WG_EASY_TEST_USER="${WG_EASY_TEST_USER:-admin}"
 WG_EASY_TEST_PASSWORD="${WG_EASY_TEST_PASSWORD:-71082aaa348e3b03d45bf7f6a2c41ef18fe3}"

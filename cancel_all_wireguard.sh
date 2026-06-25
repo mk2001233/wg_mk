@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_NAME="$(basename "$0")"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" 2>/dev/null && pwd || true)"
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR="$(pwd)"
+SCRIPT_NAME="$(basename "$SCRIPT_SOURCE")"
 MANAGED_STARTUP_LABEL="com.mk.wg_mk.client"
 MANAGED_STARTUP_PLIST="/Library/LaunchDaemons/${MANAGED_STARTUP_LABEL}.plist"
 MANAGED_STARTUP_CONFIG="/usr/local/etc/wireguard/wg_mk.conf"
